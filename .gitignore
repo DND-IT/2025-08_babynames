@@ -1,0 +1,162 @@
+# --- Projet spécifiques ---
+# Ignorer data brutes et dérivées, garder la structure
+00_data/input/*
+!00_data/input/.gitkeep
+00_data/input/raw/*
+!00_data/input/raw/.gitkeep
+00_data/input/processed/*
+!00_data/input/processed/.gitkeep
+
+00_data/output/*
+!00_data/output/.gitkeep
+# (Décommente pour versionner un export final précis)
+# !00_data/output/name_analysis_summary_2024.csv
+
+# --- Ressources / images : tout ignorer
+00_ressources/
+00_images_and_header/
+
+# RStudio export libs très lourds (widgets html) dans les notebooks
+00_data/.Rproj.user/shared/notebooks/**/lib/
+
+# Quarto
+.quarto/
+_site/
+_freeze/
+
+# --- Jupyter ---
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# ATTENTION: "lib/" en racine est ignoré ci-dessus par défaut Python ;
+# on choisit de ne PAS ignorer globalement **/lib/ pour éviter d'ignorer du code.
+# (On a ciblé la lib des notebooks plus haut.)
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+*.mo
+*.pot
+*.log
+instance/
+.webassets-cache
+.scrapy
+docs/_build/
+.pybuilder/
+target/
+/site
+.poetry.toml
+.ruff_cache/
+pyrightconfig.json
+.pdm.toml
+__pypackages__/
+celerybeat-schedule
+celerybeat.pid
+*.sage.py
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.spyderproject
+.spyproject
+.ropeproject
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+# .idea/ (décommente si tu veux ignorer PyCharm)
+#.idea/
+
+# --- R ---
+.Rhistory
+.Rapp.history
+.RData
+.RDataTmp
+.Ruserdata
+*-Ex.R
+/*.tar.gz
+/*.Rcheck/
+.Rproj.user/
+# vignettes
+vignettes/*.html
+vignettes/*.pdf
+# OAuth token
+.httr-oauth
+# knitr/Rmd caches
+*_cache/
+/cache/
+*.utf8.md
+*.knit.md
+.Renviron
+# pkgdown site
+docs/
+# traductions temporaires
+po/*~
+# RStudio Connect
+rsconnect/
+# bookdown outputs (toutes profondeurs)
+**/*_files/
+
+# --- R renv (si utilisé) ---
+renv/library/
+renv/staging/
+# Garde renv.lock et renv/activate.R dans le dépôt

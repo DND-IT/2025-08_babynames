@@ -1,0 +1,1632 @@
+---
+title: "Baby_names_script"
+author: "Olaf König"
+format:
+  html:
+    self-contained: true
+    page-layout: full
+    toc: true
+    toc-depth: 4
+    number-sections: true
+    number-depth: 4
+    code-line-numbers: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+theme: cosmo
+editor: visual
+---
+
+# Swiss First Names Analysis - Automated Annual Report
+
+## Objectives
+
+**Main goal:** Automated analysis of Swiss baby names with historical trends and multilingual article generation.
+
+**Goals:**
+
+-   Get newborn data from PX Web cubes (automatic download with new year) - Get living population data from CSV files (manual URLs - update annually)
+
+-   Generate comprehensive analysis with rankings, trends, and changes - Produce automated multilingual articles (FR/DE/EN) ready for publication - Create interactive visualizations and summary exports
+
+**Usage:**
+
+**Note:** Living population CSV URLs must be updated manually each year using browser inspector to find direct download links.
+
+------------------------------------------------------------------------
+
+## Inputs
+
+| Object Name | File Name | Source | Extension |
+|---------------------|-----------------|-----------------|-----------------|
+| babynames_female | px_names_female_YYYY | <https://www.pxweb.bfs.admin.ch/pxweb/fr/px-x-0104050000_102/-/px-x-0104050000_102.px/table/tableViewLayout2/> | .csv |
+| babynames_male | px_names_male_YYYY | <https://www.pxweb.bfs.admin.ch/pxweb/fr/px-x-0104050000_101/-/px-x-0104050000_101.px/table/tableViewLayout2/> | .csv |
+| all_female_names_ch **2023** | all_female_names_ch_2023 | <https://www.bfs.admin.ch/bfs/fr/home/statistiques/population/naissances-deces/noms-suisse.assetdetail.32208758.html> | .csv |
+| all_female_names_ch **2024** | all_female_names_ch_2024 | <https://www.bfs.admin.ch/bfs/fr/home/statistiques/population/naissances-deces/noms-suisse.assetdetail.36062347.html> | .csv |
+| all_male_names_ch **2023** | all_male_names_ch_2023 | <https://www.bfs.admin.ch/bfs/fr/home/statistiques/population/naissances-deces/noms-suisse.assetdetail.32208755.html> | .csv |
+| all_male_names_ch **2024** | all_male_names_ch_2024 | <https://www.bfs.admin.ch/bfs/fr/home/statistiques/population/naissances-deces/noms-suisse.assetdetail.36062345.html> | .csv |
+
+## Outputs
+
+| Object Name | File Name | Description | Extension |
+|-------------------|-----------------|-------------------|-----------------|
+| results_summary | name_analysis_summary_YYYY | Key metrics and rankings summary | .csv |
+| article_fr | article_fr_YYYY | French article with automated text | .html |
+| article_de | article_de_YYYY | German article with automated text | .html |
+| article_en | article_en_YYYY | English article with automated text | .html |
+| top3_evolution_male | \- | Interactive heatmap - male names evolution | plotly |
+| top3_evolution_female | \- | Interactive heatmap - female names evolution | plotly |
+| length_evolution_chart | \- | Interactive chart - name length trends | plotly |
+| rankings_tables | \- | Interactive tables - rankings by region/gender | DT |
+
+------------------------------------------------------------------------
+
+# Generic setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = TRUE,
+  message = TRUE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(tidylog)
+library(here)
+library(janitor)
+library(lubridate)
+library(DT)
+library(plotly)
+library(viridis)
+library(glue)
+library(scales)
+
+
+# Custom theme for plots
+theme_set(theme_minimal())
+
+# Disable scientific notation
+options(scipen = 999)
+# # Re-enable scientific notation (default behavior)
+# options(scipen = 0)
+```
+
+```{r setup-paths}
+# Define project paths
+input_raw_dir <- here("input", "raw")
+input_processed_dir <- here("input", "processed") 
+output_dir <- here("output")
+```
+
+------------------------------------------------------------------------
+
+# Data Import
+
+# Swiss First Names Analysis
+
+## Configuration
+
+```{r config}
+# =============================================================================
+# CONFIGURATION - UPDATE ANNUALLY
+# =============================================================================
+
+# Reference year (published data is always current year - 1)
+current_year <- year(Sys.Date())
+data_year <- current_year - 1
+comparison_year <- data_year - 1
+
+cat("Current year:", current_year, "\n")
+cat("Data year:", data_year, "\n") 
+cat("Comparison year:", comparison_year, "\n")
+
+# URLs to update manually each year
+urls_config <- list(
+  # PX Web (automatic - complete historical data)
+  px_female = "https://www.pxweb.bfs.admin.ch/sq/ea826a26-7e80-4906-a4f2-d89a145cd19e",
+  px_male = "https://www.pxweb.bfs.admin.ch/sq/7a95b4e9-f6d8-49cc-858d-cea658ac3a2b",
+  
+  # All names - current year (manual - population snapshot)
+  all_female_current = "https://dam-api.bfs.admin.ch/hub/api/dam/assets/36062347/master",
+  all_male_current = "https://dam-api.bfs.admin.ch/hub/api/dam/assets/36062345/master",
+  
+  # All names - previous year (for stock evolution comparison)
+  all_female_previous = "https://dam-api.bfs.admin.ch/hub/api/dam/assets/32208758/master",
+  all_male_previous = "https://dam-api.bfs.admin.ch/hub/api/dam/assets/32208755/master"
+)
+```
+
+## Import Functions
+
+```{r functions}
+# =============================================================================
+# IMPORT FUNCTIONS
+# =============================================================================
+
+# Function for PX Web data (with UTF-8 conversion)
+import_px_data <- function(url, filename_base, year) {
+  filename <- paste0(filename_base, "_", year, ".csv")
+  file_path <- file.path(input_raw_dir, filename)
+  
+  # Create directory if needed
+  dir.create(dirname(file_path), showWarnings = FALSE, recursive = TRUE)
+  
+  # Download
+  download.file(url, destfile = file_path, mode = "wb")
+  
+  # UTF-8 conversion
+  lines <- readLines(file_path, encoding = "Windows-1252")
+  lines_utf8 <- iconv(lines, from = "Windows-1252", to = "UTF-8")
+  writeLines(lines_utf8, file(file_path, encoding = "UTF-8"))
+  
+  # Read data
+  data <- readr::read_csv(file_path) %>%
+    janitor::clean_names()
+  
+  message("✅ ", filename, " imported successfully")
+  return(data)
+}
+
+# Function for direct CSV downloads
+import_csv_data <- function(url, filename_base, year, gender) {
+  filename <- paste0(filename_base, "_", year, ".csv")
+  file_path <- file.path(input_raw_dir, filename)
+  
+  # Download
+  download.file(url, file_path, mode = "wb")
+  
+  # Read data
+  data <- read_csv(file_path, locale = locale(encoding = "UTF-8")) %>%
+    janitor::clean_names() %>%
+    mutate(gender = gender) %>%
+    select(-obs_status)
+  
+  message("✅ ", filename, " imported successfully")
+  return(data)
+}
+```
+
+## Data Import
+
+```{r import}
+# =============================================================================
+# DATA IMPORT
+# =============================================================================
+
+# PX Data (newborns by region and year)
+assign(paste0("px_names_female_", data_year), 
+       import_px_data(urls_config$px_female, "px_names_female", data_year))
+
+assign(paste0("px_names_male_", data_year), 
+       import_px_data(urls_config$px_male, "px_names_male", data_year))
+
+# All names - current year snapshot
+assign(paste0("all_female_names_ch_", data_year),
+       import_csv_data(urls_config$all_female_current, "all_female_names_ch", data_year, "female"))
+
+assign(paste0("all_male_names_ch_", data_year),
+       import_csv_data(urls_config$all_male_current, "all_male_names_ch", data_year, "male"))
+
+# All names - previous year snapshot (for comparisons)
+assign(paste0("all_female_names_ch_", comparison_year),
+       import_csv_data(urls_config$all_female_previous, "all_female_names_ch", comparison_year, "female"))
+
+assign(paste0("all_male_names_ch_", comparison_year),
+       import_csv_data(urls_config$all_male_previous, "all_male_names_ch", comparison_year, "male"))
+
+# Control output
+cat("📊 Data imported for year:", data_year, "\n")
+cat("🔍 Comparison year:", comparison_year, "\n")
+cat("📁 Files saved in:", input_raw_dir, "\n")
+```
+
+## Data Quality Check
+
+```{r check-functions}
+# =============================================================================
+# ENCODING CHECK FUNCTION
+# =============================================================================
+
+# Function to check encoding issues in name columns
+check_encoding <- function(df, col) {
+  col <- enquo(col)  # capture the column
+  
+  df %>%
+    mutate(.value = as.character(!!col)) %>%
+    # Find characters that are NEITHER letters NOR hyphens
+    filter(str_detect(.value, "[^[:alpha:]-]")) %>%
+    distinct(.value) %>% 
+    arrange(.value)
+}
+```
+
+```{r encoding-checks}
+# =============================================================================
+# ENCODING VERIFICATION
+# =============================================================================
+
+# Get current datasets (using get() to access dynamically named objects)
+px_female_current <- get(paste0("px_names_female_", data_year))
+px_male_current <- get(paste0("px_names_male_", data_year))
+all_female_current <- get(paste0("all_female_names_ch_", data_year))
+all_male_current <- get(paste0("all_male_names_ch_", data_year))
+
+# Check encoding issues
+cat("🔍 Checking encoding issues...\n")
+
+cat("\nPX Female names with encoding issues:\n")
+print(check_encoding(px_female_current, prenom))
+
+cat("\nPX Male names with encoding issues:\n")
+print(check_encoding(px_male_current, prenom))
+
+cat("\nAll female names with encoding issues:\n")
+print(check_encoding(all_female_current, firstname))
+
+cat("\nAll male names with encoding issues:\n")
+print(check_encoding(all_male_current, firstname))
+
+cat("✅ Encoding checks completed\n")
+```
+
+## ------------------------------------------------------------------------
+
+# Chapter 1 - Rankings and Podiums
+
+```{r setup-ch1, include=FALSE}
+library(tidyverse)
+library(DT)
+
+# Configuration parameters
+top_n_analysis <- 200
+top_n_display <- 100
+```
+
+## Data Processing
+
+```{r data-processing}
+# Get current datasets
+px_female_current <- get(paste0("px_names_female_", data_year))
+px_male_current <- get(paste0("px_names_male_", data_year))
+
+# Transform PX data from wide to long format
+px_female_long <- px_female_current %>%
+  pivot_longer(cols = starts_with("x"), 
+               names_to = "year", 
+               values_to = "value") %>%
+  mutate(
+    year = as.numeric(str_remove(year, "x")),
+    gender = "female"
+  ) %>%
+  filter(!is.na(value))
+
+px_male_long <- px_male_current %>%
+  pivot_longer(cols = starts_with("x"), 
+               names_to = "year", 
+               values_to = "value") %>%
+  mutate(
+    year = as.numeric(str_remove(year, "x")),
+    gender = "male"
+  ) %>%
+  filter(!is.na(value))
+
+# Combine both datasets
+px_names_combined <- bind_rows(px_female_long, px_male_long)
+
+# Create custom rankings (unique ranks: by count DESC then alphabetically)
+px_names_with_custom_ranks <- px_names_combined %>%
+  filter(unite_de_mesure == "Nombre") %>%  # Use counts only
+  group_by(region_linguistique_canton, year, gender) %>%
+  arrange(desc(value), prenom) %>%
+  mutate(custom_rank = row_number()) %>%
+  ungroup()
+
+cat("✅ Data transformation completed\n")
+cat("Years available:", min(px_names_with_custom_ranks$year), "-", max(px_names_with_custom_ranks$year), "\n")
+```
+
+## 1.1 National Top 3 Rankings
+
+### Top 3 Male Names {data_year}
+
+```{r national-top3-male}
+# Extract national top 3 male names for current year
+national_top3_male <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         year == data_year,
+         gender == "male",
+         custom_rank <= 3) %>%
+  select(prenom, value, custom_rank) %>%
+  arrange(custom_rank)
+
+# Print results
+print("National Top 3 Male Names:")
+print(national_top3_male)
+
+# Display as datatable
+datatable(national_top3_male, 
+          colnames = c("First Name", "Count", "Rank"),
+          options = list(dom = 't', pageLength = 10),
+          caption = paste("Top 3 Male Names in Switzerland", data_year))
+```
+
+### Top 3 Female Names {data_year}
+
+```{r national-top3-female}
+# Extract national top 3 female names for current year
+national_top3_female <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         year == data_year,
+         gender == "female",
+         custom_rank <= 3) %>%
+  select(prenom, value, custom_rank) %>%
+  arrange(custom_rank)
+
+# Print results
+print("National Top 3 Female Names:")
+print(national_top3_female)
+
+# Display as datatable
+datatable(national_top3_female, 
+          colnames = c("First Name", "Count", "Rank"),
+          options = list(dom = 't', pageLength = 10),
+          caption = paste("Top 3 Female Names in Switzerland", data_year))
+```
+
+## 1.2 Regional Top 3 Rankings
+
+### Top 3 Male Names by Linguistic Region
+
+```{r regional-top3-male}
+# Extract regional top 3 male names
+regional_top3_male <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton %in% c("Suisse alémanique", "Suisse romande", "Suisse italienne"),
+         year == data_year,
+         gender == "male",
+         custom_rank <= 3) %>%
+  select(region_linguistique_canton, prenom, value, custom_rank) %>%
+  arrange(region_linguistique_canton, custom_rank)
+
+# Print results
+print("Regional Top 3 Male Names:")
+print(regional_top3_male)
+
+# Display as datatable
+datatable(regional_top3_male, 
+          colnames = c("Region", "First Name", "Count", "Rank"),
+          options = list(dom = 't', pageLength = 15),
+          caption = paste("Top 3 Male Names by Linguistic Region", data_year))
+```
+
+### Top 3 Female Names by Linguistic Region
+
+```{r regional-top3-female}
+# Extract regional top 3 female names
+regional_top3_female <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton %in% c("Suisse alémanique", "Suisse romande", "Suisse italienne"),
+         year == data_year,
+         gender == "female",
+         custom_rank <= 3) %>%
+  select(region_linguistique_canton, prenom, value, custom_rank) %>%
+  arrange(region_linguistique_canton, custom_rank)
+
+# Print results
+print("Regional Top 3 Female Names:")
+print(regional_top3_female)
+
+# Display as datatable
+datatable(regional_top3_female, 
+          colnames = c("Region", "First Name", "Count", "Rank"),
+          options = list(dom = 't', pageLength = 15),
+          caption = paste("Top 3 Female Names by Linguistic Region", data_year))
+```
+
+## Store Results for Text Generation
+
+```{r store-results-ch1}
+# Initialize results structure
+if (!exists("results")) {
+  results <- list()
+}
+
+# Store national rankings
+results$rankings <- list(
+  national = list(
+    male = national_top3_male$prenom,
+    female = national_top3_female$prenom
+  ),
+  regional = list(
+    alemanique = list(
+      male = regional_top3_male %>% filter(region_linguistique_canton == "Suisse alémanique") %>% pull(prenom),
+      female = regional_top3_female %>% filter(region_linguistique_canton == "Suisse alémanique") %>% pull(prenom)
+    ),
+    romande = list(
+      male = regional_top3_male %>% filter(region_linguistique_canton == "Suisse romande") %>% pull(prenom),
+      female = regional_top3_female %>% filter(region_linguistique_canton == "Suisse romande") %>% pull(prenom)
+    ),
+    italienne = list(
+      male = regional_top3_male %>% filter(region_linguistique_canton == "Suisse italienne") %>% pull(prenom),
+      female = regional_top3_female %>% filter(region_linguistique_canton == "Suisse italienne") %>% pull(prenom)
+    )
+  )
+)
+
+cat("✅ Chapter 1 results stored\n")
+```
+
+## ------------------------------------------------------------------------
+
+# Chapter 2 - Evolution and Stability of Leaders
+
+```{r setup-ch2, include=FALSE}
+library(tidyverse)
+library(DT)
+library(plotly)
+library(viridis)
+```
+
+## 2.1 Years as #1 Leader
+
+### Male Leader Analysis
+
+```{r male-leader-years}
+# Find current #1 male name
+current_male_leader <- results$rankings$national$male[1]
+
+# Find all years where this name was #1 nationally
+male_leader_years <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         gender == "male",
+         custom_rank == 1) %>%
+  filter(prenom == current_male_leader) %>%
+  select(year, prenom, value) %>%
+  arrange(year)
+
+# Summary
+male_leader_summary <- tibble(
+  name = current_male_leader,
+  total_years_as_leader = nrow(male_leader_years),
+  years_list = list(male_leader_years$year)
+)
+
+# Print results
+print(paste("Male leader analysis for:", current_male_leader))
+print(male_leader_summary)
+print("Years as #1:")
+print(male_leader_years)
+
+# Display as datatable
+datatable(male_leader_years, 
+          colnames = c("Year", "Name", "Count"),
+          options = list(dom = 't', pageLength = 20),
+          caption = paste("Years when", current_male_leader, "was #1 nationally"))
+```
+
+### Female Leader Analysis
+
+```{r female-leader-years}
+# Find current #1 female name
+current_female_leader <- results$rankings$national$female[1]
+
+# Find all years where this name was #1 nationally
+female_leader_years <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         gender == "female",
+         custom_rank == 1) %>%
+  filter(prenom == current_female_leader) %>%
+  select(year, prenom, value) %>%
+  arrange(year)
+
+# Summary
+female_leader_summary <- tibble(
+  name = current_female_leader,
+  total_years_as_leader = nrow(female_leader_years),
+  years_list = list(female_leader_years$year)
+)
+
+# Print results
+print(paste("Female leader analysis for:", current_female_leader))
+print(female_leader_summary)
+print("Years as #1:")
+print(female_leader_years)
+
+# Display as datatable
+datatable(female_leader_years, 
+          colnames = c("Year", "Name", "Count"),
+          options = list(dom = 't', pageLength = 20),
+          caption = paste("Years when", current_female_leader, "was #1 nationally"))
+```
+
+## 2.2 Top 3 Evolution Over Time
+
+### Male Top 20 Evolution (Last 10 Years)
+
+```{r male-top20-evolution}
+# Get current year top 20 male names (ordered by current rank)
+male_current_top20 <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         gender == "male",
+         year == data_year,
+         custom_rank <= 20) %>%
+  arrange(custom_rank) %>%
+  pull(prenom)
+
+# Get evolution for last 10 years
+years_range <- seq(data_year - 9, data_year)
+
+male_evolution_matrix <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         gender == "male",
+         year %in% years_range,
+         prenom %in% male_current_top20) %>%
+  select(year, prenom, custom_rank) %>%
+  complete(year, prenom, fill = list(custom_rank = NA)) %>%
+  # Order names by current year ranking
+  mutate(prenom = factor(prenom, levels = male_current_top20))
+
+# Print evolution data
+print("Male Top 20 Evolution (Last 10 Years):")
+print(male_evolution_matrix %>% arrange(prenom, year))
+
+# Create improved heatmap with exact color mapping
+max_rank <- 20
+# 3 fixed colors for ranks 1/2/3 then blue gradient for 4..20
+blue_ramp <- colorRampPalette(c("#deebf7", "#9ecae1", "#3182bd"))(max_rank - 3)
+rank_colors <- c("#e34a33", "#fdbb84", "#fee8c8", blue_ramp)
+names(rank_colors) <- 1:max_rank
+
+male_heatmap_improved <- male_evolution_matrix %>%
+  ggplot(aes(x = year, y = prenom, fill = factor(custom_rank))) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = ifelse(is.na(custom_rank), "", custom_rank)), 
+            color = "black", fontface = "bold", size = 3) +
+  # Manual color scale with exact mapping
+  scale_fill_manual(
+    values = rank_colors,
+    na.value = "grey90",
+    name = "Rank"
+  ) +
+  scale_y_discrete(limits = rev(levels(male_evolution_matrix$prenom))) +
+  labs(title = "Male Names Evolution - Last 10 Years (Current Top 20)",
+       x = "Year", y = "Name") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# Convert to plotly
+male_heatmap_plotly <- ggplotly(male_heatmap_improved, 
+                                tooltip = c("x", "y", "fill")) %>%
+  layout(hovermode = "closest")
+
+male_heatmap_plotly
+```
+
+### Female Top 20 Evolution (Last 10 Years)
+
+```{r female-top20-evolution}
+# Get current year top 20 female names (ordered by current rank)
+female_current_top20 <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         gender == "female",
+         year == data_year,
+         custom_rank <= 20) %>%
+  arrange(custom_rank) %>%
+  pull(prenom)
+
+# Get evolution for last 10 years
+female_evolution_matrix <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         gender == "female",
+         year %in% years_range,
+         prenom %in% female_current_top20) %>%
+  select(year, prenom, custom_rank) %>%
+  complete(year, prenom, fill = list(custom_rank = NA)) %>%
+  # Order names by current year ranking
+  mutate(prenom = factor(prenom, levels = female_current_top20))
+
+# Print evolution data
+print("Female Top 20 Evolution (Last 10 Years):")
+print(female_evolution_matrix %>% arrange(prenom, year))
+
+# Create improved heatmap with exact color mapping
+max_rank <- 20
+# 3 fixed colors for ranks 1/2/3 then blue gradient for 4..20
+blue_ramp <- colorRampPalette(c("#deebf7", "#9ecae1", "#3182bd"))(max_rank - 3)
+rank_colors <- c("#e34a33", "#fdbb84", "#fee8c8", blue_ramp)
+names(rank_colors) <- 1:max_rank
+
+female_heatmap_improved <- female_evolution_matrix %>%
+  ggplot(aes(x = year, y = prenom, fill = factor(custom_rank))) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = ifelse(is.na(custom_rank), "", custom_rank)), 
+            color = "black", fontface = "bold", size = 3) +
+  # Manual color scale with exact mapping
+  scale_fill_manual(
+    values = rank_colors,
+    na.value = "grey90",
+    name = "Rank"
+  ) +
+  scale_y_discrete(limits = rev(levels(female_evolution_matrix$prenom))) +
+  labs(title = "Female Names Evolution - Last 10 Years (Current Top 20)",
+       x = "Year", y = "Name") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# Convert to plotly
+female_heatmap_plotly <- ggplotly(female_heatmap_improved, 
+                                  tooltip = c("x", "y", "fill")) %>%
+  layout(hovermode = "closest")
+
+female_heatmap_plotly
+```
+
+## Store Results for Text Generation
+
+```{r store-results-ch2}
+# Store leader analysis results
+results$leaders <- list(
+  male_leader = list(
+    name = current_male_leader,
+    years_as_top = male_leader_summary$total_years_as_leader,
+    years_list = male_leader_years$year
+  ),
+  female_leader = list(
+    name = current_female_leader,
+    years_as_top = female_leader_summary$total_years_as_leader,
+    years_list = female_leader_years$year
+  )
+)
+
+# Store top 20 evolution data
+results$evolution <- list(
+  male_current_top20 = male_current_top20,
+  female_current_top20 = female_current_top20
+)
+
+cat("✅ Chapter 2 results stored\n")
+cat("Male leader:", current_male_leader, "- Years as #1:", male_leader_summary$total_years_as_leader, "\n")
+cat("Female leader:", current_female_leader, "- Years as #1:", female_leader_summary$total_years_as_leader, "\n")
+```
+
+## ------------------------------------------------------------------------
+
+# Chapter 3 - Biggest Changes Year-over-Year
+
+```{r setup-ch3, include=FALSE}
+library(tidyverse)
+library(DT)
+```
+
+## Data Preparation for Changes Analysis
+
+```{r changes-data-prep}
+# Get rankings for comparison year and current year (top 200 each year)
+rankings_comparison_year <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         year == comparison_year,
+         custom_rank <= top_n_analysis) %>%
+  select(prenom, gender, value, custom_rank) %>%
+  rename(rank_prev = custom_rank, count_prev = value)
+
+rankings_current_year <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse",
+         year == data_year,
+         custom_rank <= top_n_analysis) %>%
+  select(prenom, gender, value, custom_rank) %>%
+  rename(rank_current = custom_rank, count_current = value)
+
+# Combine both years to calculate changes
+rank_changes <- full_join(rankings_comparison_year, rankings_current_year, 
+                         by = c("prenom", "gender")) %>%
+  mutate(
+    rank_prev = ifelse(is.na(rank_prev), top_n_analysis + 1, rank_prev),
+    rank_current = ifelse(is.na(rank_current), top_n_analysis + 1, rank_current),
+    rank_change = rank_prev - rank_current,  # Positive = gained positions (climbed up)
+    count_change = count_current - count_prev,
+    # Status categorization
+    status = case_when(
+      is.na(count_prev) & !is.na(count_current) ~ "New Entry",
+      !is.na(count_prev) & is.na(count_current) ~ "Dropped Out", 
+      TRUE ~ "Continued"
+    )
+  ) %>%
+  filter(!is.na(prenom))
+
+cat("✅ Changes analysis data prepared\n")
+cat("Total names analyzed:", nrow(rank_changes), "\n")
+```
+
+## 3.1 Biggest Climbers
+
+### Male Biggest Climbers
+
+```{r male-climbers}
+# Male names with biggest positive rank changes
+male_climbers <- rank_changes %>%
+  filter(gender == "male", 
+         status == "Continued",
+         rank_change > 0) %>%
+  arrange(desc(rank_change)) %>%
+  slice_head(n = 10) %>%
+  select(prenom, rank_prev, rank_current, rank_change, count_prev, count_current, count_change)
+
+# Print results
+print("Male Names - Biggest Climbers:")
+print(male_climbers)
+
+# Display as datatable
+datatable(male_climbers, 
+          colnames = c("Name", "Rank Previous", "Rank Current", "Rank Change", 
+                      "Count Previous", "Count Current", "Count Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = paste("Male Names with Biggest Rank Gains", comparison_year, "→", data_year))
+```
+
+### Female Biggest Climbers
+
+```{r female-climbers}
+# Female names with biggest positive rank changes
+female_climbers <- rank_changes %>%
+  filter(gender == "female", 
+         status == "Continued",
+         rank_change > 0) %>%
+  arrange(desc(rank_change)) %>%
+  slice_head(n = 10) %>%
+  select(prenom, rank_prev, rank_current, rank_change, count_prev, count_current, count_change)
+
+# Print results
+print("Female Names - Biggest Climbers:")
+print(female_climbers)
+
+# Display as datatable
+datatable(female_climbers, 
+          colnames = c("Name", "Rank Previous", "Rank Current", "Rank Change", 
+                      "Count Previous", "Count Current", "Count Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = paste("Female Names with Biggest Rank Gains", comparison_year, "→", data_year))
+```
+
+## 3.2 Biggest Fallers
+
+### Male Biggest Fallers
+
+```{r male-fallers}
+# Male names with biggest negative rank changes
+male_fallers <- rank_changes %>%
+  filter(gender == "male", 
+         status == "Continued",
+         rank_change < 0) %>%
+  arrange(rank_change) %>%
+  slice_head(n = 10) %>%
+  select(prenom, rank_prev, rank_current, rank_change, count_prev, count_current, count_change)
+
+# Print results
+print("Male Names - Biggest Fallers:")
+print(male_fallers)
+
+# Display as datatable
+datatable(male_fallers, 
+          colnames = c("Name", "Rank Previous", "Rank Current", "Rank Change", 
+                      "Count Previous", "Count Current", "Count Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = paste("Male Names with Biggest Rank Losses", comparison_year, "→", data_year))
+```
+
+### Female Biggest Fallers
+
+```{r female-fallers}
+# Female names with biggest negative rank changes
+female_fallers <- rank_changes %>%
+  filter(gender == "female", 
+         status == "Continued",
+         rank_change < 0) %>%
+  arrange(rank_change) %>%
+  slice_head(n = 10) %>%
+  select(prenom, rank_prev, rank_current, rank_change, count_prev, count_current, count_change)
+
+# Print results
+print("Female Names - Biggest Fallers:")
+print(female_fallers)
+
+# Display as datatable
+datatable(female_fallers, 
+          colnames = c("Name", "Rank Previous", "Rank Current", "Rank Change", 
+                      "Count Previous", "Count Current", "Count Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = paste("Female Names with Biggest Rank Losses", comparison_year, "→", data_year))
+```
+
+## 3.3 New Entries and Exits from Top 100
+
+### New Entries to Top 100
+
+#### Male New Entries
+
+```{r male-new-entries}
+# Male names entering top 100
+male_new_entries <- rank_changes %>%
+  filter(gender == "male",
+         rank_current <= top_n_display,
+         (is.na(rank_prev) | rank_prev > top_n_display)) %>%
+  arrange(rank_current) %>%
+  select(prenom, rank_current, count_current)
+
+# Print results
+print("Male Names - New Entries to Top 100:")
+print(male_new_entries)
+
+# Display as datatable
+datatable(male_new_entries, 
+          colnames = c("Name", "Current Rank", "Current Count"),
+          options = list(dom = 't', pageLength = 15),
+          caption = paste("Male Names Entering Top 100 in", data_year))
+```
+
+#### Female New Entries
+
+```{r female-new-entries}
+# Female names entering top 100
+female_new_entries <- rank_changes %>%
+  filter(gender == "female",
+         rank_current <= top_n_display,
+         (is.na(rank_prev) | rank_prev > top_n_display)) %>%
+  arrange(rank_current) %>%
+  select(prenom, rank_current, count_current)
+
+# Print results
+print("Female Names - New Entries to Top 100:")
+print(female_new_entries)
+
+# Display as datatable
+datatable(female_new_entries, 
+          colnames = c("Name", "Current Rank", "Current Count"),
+          options = list(dom = 't', pageLength = 15),
+          caption = paste("Female Names Entering Top 100 in", data_year))
+```
+
+### Exits from Top 100
+
+#### Male Exits
+
+```{r male-exits}
+# Male names exiting top 100
+male_exits <- rank_changes %>%
+  filter(gender == "male",
+         rank_prev <= top_n_display,
+         (is.na(rank_current) | rank_current > top_n_display)) %>%
+  arrange(rank_prev) %>%
+  select(prenom, rank_prev, count_prev)
+
+# Print results
+print("Male Names - Exits from Top 100:")
+print(male_exits)
+
+# Display as datatable
+datatable(male_exits, 
+          colnames = c("Name", "Previous Rank", "Previous Count"),
+          options = list(dom = 't', pageLength = 15),
+          caption = paste("Male Names Exiting Top 100 in", data_year))
+```
+
+#### Female Exits
+
+```{r female-exits}
+# Female names exiting top 100
+female_exits <- rank_changes %>%
+  filter(gender == "female",
+         rank_prev <= top_n_display,
+         (is.na(rank_current) | rank_current > top_n_display)) %>%
+  arrange(rank_prev) %>%
+  select(prenom, rank_prev, count_prev)
+
+# Print results
+print("Female Names - Exits from Top 100:")
+print(female_exits)
+
+# Display as datatable
+datatable(female_exits, 
+          colnames = c("Name", "Previous Rank", "Previous Count"),
+          options = list(dom = 't', pageLength = 15),
+          caption = paste("Female Names Exiting Top 100 in", data_year))
+```
+
+## Store Results for Text Generation
+
+```{r store-results-ch3}
+# Store biggest changes results
+results$changes <- list(
+  male_biggest_climber = if(nrow(male_climbers) > 0) {
+    list(name = male_climbers$prenom[1], rank_change = male_climbers$rank_change[1])
+  } else { list(name = NA, rank_change = 0) },
+  
+  female_biggest_climber = if(nrow(female_climbers) > 0) {
+    list(name = female_climbers$prenom[1], rank_change = female_climbers$rank_change[1])
+  } else { list(name = NA, rank_change = 0) },
+  
+  male_biggest_faller = if(nrow(male_fallers) > 0) {
+    list(name = male_fallers$prenom[1], rank_change = abs(male_fallers$rank_change[1]))
+  } else { list(name = NA, rank_change = 0) },
+  
+  female_biggest_faller = if(nrow(female_fallers) > 0) {
+    list(name = female_fallers$prenom[1], rank_change = abs(female_fallers$rank_change[1]))
+  } else { list(name = NA, rank_change = 0) },
+  
+  new_entries = list(
+    male = male_new_entries$prenom,
+    female = female_new_entries$prenom
+  ),
+  
+  exits = list(
+    male = male_exits$prenom,
+    female = female_exits$prenom
+  )
+)
+
+cat("✅ Chapter 3 results stored\n")
+cat("Top climbers:", results$changes$male_biggest_climber$name, "(M),", results$changes$female_biggest_climber$name, "(F)\n")
+cat("Top fallers:", results$changes$male_biggest_faller$name, "(M),", results$changes$female_biggest_faller$name, "(F)\n")
+```
+
+## ------------------------------------------------------------------------
+
+# Chapter 4 - Total Population Analysis
+
+```{r setup-ch4, include=FALSE}
+library(tidyverse)
+library(DT)
+```
+
+## Data Preparation for Population Analysis
+
+```{r population-data-prep}
+# Get current and previous year population data
+all_names_current <- bind_rows(
+  get(paste0("all_female_names_ch_", data_year)),
+  get(paste0("all_male_names_ch_", data_year))
+)
+
+all_names_previous <- bind_rows(
+  get(paste0("all_female_names_ch_", comparison_year)),
+  get(paste0("all_male_names_ch_", comparison_year))
+)
+
+# Group by name and gender for current year
+population_current <- all_names_current %>%
+  group_by(firstname, gender) %>%
+  summarise(total_population_current = sum(value), .groups = 'drop') %>%
+  arrange(desc(total_population_current))
+
+# Group by name and gender for previous year
+population_previous <- all_names_previous %>%
+  group_by(firstname, gender) %>%
+  summarise(total_population_previous = sum(value), .groups = 'drop')
+
+# Combine and calculate changes
+population_changes <- full_join(population_previous, population_current, 
+                               by = c("firstname", "gender")) %>%
+  mutate(
+    total_population_current = ifelse(is.na(total_population_current), 0, total_population_current),
+    total_population_previous = ifelse(is.na(total_population_previous), 0, total_population_previous),
+    population_change = total_population_current - total_population_previous
+  ) %>%
+  filter(total_population_current > 0) %>%  # Keep only names still in population
+  arrange(desc(total_population_current))
+
+cat("✅ Population analysis data prepared\n")
+cat("Total unique names in current population:", nrow(population_changes), "\n")
+```
+
+## 4.1 Most Common Names in Total Population
+
+### Male Most Common Names
+
+```{r male-most-common}
+# Top 20 most common male names in total population
+male_most_common <- population_changes %>%
+  filter(gender == "male") %>%
+  slice_head(n = 20) %>%
+  select(firstname, total_population_current, total_population_previous, population_change)
+
+# Print results
+print("Male Names - Most Common in Total Population:")
+print(male_most_common)
+
+# Display as datatable
+datatable(male_most_common, 
+          colnames = c("Name", paste("Total", data_year), paste("Total", comparison_year), "Change"),
+          options = list(dom = 't', pageLength = 20),
+          caption = paste("Most Common Male Names in Swiss Population", data_year)) %>%
+  formatRound(c("total_population_current", "total_population_previous", "population_change"), 
+              digits = 0, mark = "'")
+```
+
+### Female Most Common Names
+
+```{r female-most-common}
+# Top 20 most common female names in total population
+female_most_common <- population_changes %>%
+  filter(gender == "female") %>%
+  slice_head(n = 20) %>%
+  select(firstname, total_population_current, total_population_previous, population_change)
+
+# Print results
+print("Female Names - Most Common in Total Population:")
+print(female_most_common)
+
+# Display as datatable
+datatable(female_most_common, 
+          colnames = c("Name", paste("Total", data_year), paste("Total", comparison_year), "Change"),
+          options = list(dom = 't', pageLength = 20),
+          caption = paste("Most Common Female Names in Swiss Population", data_year)) %>%
+  formatRound(c("total_population_current", "total_population_previous", "population_change"), 
+              digits = 0, mark = "'")
+```
+
+## 4.2 Specific Name Evolution Analysis
+
+### Traditional Leaders Evolution
+
+```{r traditional-leaders}
+# Look for Maria and Daniel specifically (traditional most common names)
+traditional_names <- c("Maria", "Daniel")
+
+traditional_evolution <- population_changes %>%
+  filter(firstname %in% traditional_names) %>%
+  select(firstname, gender, total_population_current, total_population_previous, population_change) %>%
+  arrange(desc(total_population_current))
+
+# Print results
+print("Evolution of Traditional Most Common Names:")
+print(traditional_evolution)
+
+# Display as datatable
+datatable(traditional_evolution, 
+          colnames = c("Name", "Gender", paste("Total", data_year), paste("Total", comparison_year), "Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = "Evolution of Traditionally Most Common Names") %>%
+  formatRound(c("total_population_current", "total_population_previous", "population_change"), 
+              digits = 0, mark = "'")
+```
+
+### Biggest Population Changes
+
+```{r biggest-population-changes}
+# Names with biggest absolute population changes (positive and negative)
+biggest_increases <- population_changes %>%
+  filter(population_change > 0) %>%
+  arrange(desc(population_change)) %>%
+  slice_head(n = 10) %>%
+  select(firstname, gender, total_population_current, total_population_previous, population_change)
+
+biggest_decreases <- population_changes %>%
+  filter(population_change < 0) %>%
+  arrange(population_change) %>%
+  slice_head(n = 10) %>%
+  select(firstname, gender, total_population_current, total_population_previous, population_change)
+
+# Print results
+print("Names with Biggest Population Increases:")
+print(biggest_increases)
+
+print("Names with Biggest Population Decreases:")
+print(biggest_decreases)
+
+# Display as datatables
+datatable(biggest_increases, 
+          colnames = c("Name", "Gender", paste("Total", data_year), paste("Total", comparison_year), "Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = "Names with Biggest Population Increases") %>%
+  formatRound(c("total_population_current", "total_population_previous", "population_change"), 
+              digits = 0, mark = "'")
+
+datatable(biggest_decreases, 
+          colnames = c("Name", "Gender", paste("Total", data_year), paste("Total", comparison_year), "Change"),
+          options = list(dom = 't', pageLength = 10),
+          caption = "Names with Biggest Population Decreases") %>%
+  formatRound(c("total_population_current", "total_population_previous", "population_change"), 
+              digits = 0, mark = "'")
+```
+
+## Store Results for Text Generation
+
+```{r store-results-ch4}
+# Store population analysis results
+results$population <- list(
+  most_common = list(
+    male_top = male_most_common$firstname[1:3],
+    female_top = female_most_common$firstname[1:3],
+    male_top_counts = male_most_common$total_population_current[1:3],
+    female_top_counts = female_most_common$total_population_current[1:3]
+  ),
+  
+  traditional_leaders = list(
+    maria_current = if("Maria" %in% traditional_evolution$firstname) {
+      traditional_evolution %>% filter(firstname == "Maria") %>% pull(total_population_current)
+    } else { NA },
+    maria_previous = if("Maria" %in% traditional_evolution$firstname) {
+      traditional_evolution %>% filter(firstname == "Maria") %>% pull(total_population_previous)
+    } else { NA },
+    daniel_current = if("Daniel" %in% traditional_evolution$firstname) {
+      traditional_evolution %>% filter(firstname == "Daniel") %>% pull(total_population_current)
+    } else { NA },
+    daniel_previous = if("Daniel" %in% traditional_evolution$firstname) {
+      traditional_evolution %>% filter(firstname == "Daniel") %>% pull(total_population_previous)
+    } else { NA }
+  ),
+  
+  biggest_changes = list(
+    biggest_increase = if(nrow(biggest_increases) > 0) {
+      list(name = biggest_increases$firstname[1], 
+           gender = biggest_increases$gender[1],
+           change = biggest_increases$population_change[1])
+    } else { list(name = NA, gender = NA, change = 0) },
+    
+    biggest_decrease = if(nrow(biggest_decreases) > 0) {
+      list(name = biggest_decreases$firstname[1], 
+           gender = biggest_decreases$gender[1],
+           change = abs(biggest_decreases$population_change[1]))
+    } else { list(name = NA, gender = NA, change = 0) }
+  )
+)
+
+cat("✅ Chapter 4 results stored\n")
+cat("Most common names - Male:", paste(results$population$most_common$male_top, collapse = ", "), "\n")
+cat("Most common names - Female:", paste(results$population$most_common$female_top, collapse = ", "), "\n")
+```
+
+## ------------------------------------------------------------------------
+
+# Chapter 5 - Complementary Analyses
+
+```{r setup-ch5, include=FALSE}
+library(tidyverse)
+library(DT)
+library(plotly)
+```
+
+## 5.1 Name Diversity Evolution
+
+```{r diversity-analysis}
+# Calculate diversity metrics by year (using PX data for newborns)
+diversity_evolution <- px_names_with_custom_ranks %>%
+  filter(region_linguistique_canton == "Suisse") %>%
+  group_by(year, gender) %>%
+  summarise(
+    total_births = sum(value, na.rm = TRUE),
+    unique_names = n_distinct(prenom),
+    top10_births = sum(value[custom_rank <= 10], na.rm = TRUE),
+    top10_concentration = (top10_births / total_births) * 100,
+    .groups = 'drop'
+  )
+
+# Print results for male and female separately
+diversity_male <- diversity_evolution %>% 
+  filter(gender == "male") %>%
+  select(year, total_births, unique_names, top10_concentration)
+
+diversity_female <- diversity_evolution %>% 
+  filter(gender == "female") %>%
+  select(year, total_births, unique_names, top10_concentration)
+
+print("Name Diversity Evolution - Male:")
+print(diversity_male)
+
+print("Name Diversity Evolution - Female:")
+print(diversity_female)
+```
+
+```{r diversity-tables}
+# Display as datatables
+datatable(diversity_male, 
+          colnames = c("Year", "Total Births", "Unique Names", "Top 10 Concentration (%)"),
+          options = list(dom = 't', pageLength = 25),
+          caption = "Name Diversity Evolution - Male Names") %>%
+  formatRound(c("top10_concentration"), digits = 1)
+
+datatable(diversity_female, 
+          colnames = c("Year", "Total Births", "Unique Names", "Top 10 Concentration (%)"),
+          options = list(dom = 't', pageLength = 25),
+          caption = "Name Diversity Evolution - Female Names") %>%
+  formatRound(c("top10_concentration"), digits = 1)
+```
+
+## 5.2 Average Name Length Analysis
+
+### Name Length by Birth Year
+
+```{r name-length-by-birth}
+# Calculate average name length by birth year using POPULATION data (CORRECTED)
+length_by_birth_year <- all_names_current %>%
+  mutate(name_length = nchar(firstname)) %>%
+  group_by(yearofbirth, gender) %>%
+  summarise(
+    avg_length = mean(name_length, na.rm = TRUE),  # Simple mean of unique names
+    total_people = sum(value, na.rm = TRUE),
+    unique_names = n_distinct(firstname),
+    .groups = 'drop'
+  ) %>%
+  filter(yearofbirth >= 1950, total_people >= 100) %>%  # Filter for reliable data
+  arrange(yearofbirth)
+
+# Calculate overall average by year for both genders combined
+length_by_birth_year_combined <- length_by_birth_year %>%
+  group_by(yearofbirth) %>%
+  summarise(
+    avg_length_combined = mean(avg_length),  # Simple mean of male/female averages
+    .groups = 'drop'
+  )
+
+# Combine data for visualization
+length_data_complete <- length_by_birth_year %>%
+  left_join(length_by_birth_year_combined, by = "yearofbirth")
+
+# Print recent years data
+recent_length <- length_data_complete %>%
+  filter(yearofbirth >= data_year - 10) %>%
+  arrange(desc(yearofbirth))
+
+print("Average Name Length - Recent Birth Years (Population Data):")
+print(recent_length)
+```
+
+```{r length-table}
+# Display as datatable
+datatable(recent_length, 
+          colnames = c("Birth Year", "Gender", "Avg Length", "Total People", "Combined Avg"),
+          options = list(dom = 't', pageLength = 25),
+          caption = "Average Name Length by Birth Year (Population Data)") %>%
+  formatRound(c("avg_length", "avg_length_combined"), digits = 2) %>%
+  formatRound(c("total_people"), digits = 0, mark = "'")
+```
+
+### Interactive Name Length Evolution Chart
+
+```{r name-length-chart}
+# Create interactive plotly chart
+length_plot <- ggplot(length_data_complete, aes(x = yearofbirth)) +
+  geom_line(aes(y = avg_length, color = gender, group = gender), size = 1.2) +
+  geom_line(aes(y = avg_length_combined), color = "black", linetype = "dashed", size = 1) +
+  scale_color_manual(values = c("female" = "#e34a33", "male" = "#3182bd"), 
+                     name = "Gender") +
+  labs(title = "Average Name Length Evolution by Birth Year",
+       x = "Birth Year",
+       y = "Average Name Length (characters)",
+       subtitle = "Dashed line shows combined average") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Convert to plotly for interactivity
+length_plot_interactive <- ggplotly(length_plot, tooltip = c("x", "y", "colour")) %>%
+  layout(hovermode = "x unified")
+
+length_plot_interactive
+```
+
+### Current Year Name Length Analysis
+
+```{r current-year-length}
+# Calculate name length for current year births using POPULATION data (CORRECTED)
+current_year_length <- all_names_current %>%
+  filter(yearofbirth == data_year) %>%
+  mutate(name_length = nchar(firstname)) %>%
+  group_by(gender) %>%
+  summarise(
+    avg_length = mean(name_length, na.rm = TRUE),  # Simple mean of unique names
+    total_people = sum(value, na.rm = TRUE),
+    unique_names = n_distinct(firstname),
+    .groups = 'drop'
+  )
+
+# Overall average for current year
+current_year_overall <- all_names_current %>%
+  filter(yearofbirth == data_year) %>%
+  mutate(name_length = nchar(firstname)) %>%
+  summarise(
+    avg_length_overall = mean(name_length, na.rm = TRUE),  # Simple mean of unique names
+    total_people = sum(value, na.rm = TRUE),
+    unique_names = n_distinct(firstname)
+  )
+
+# Combine results
+current_length_summary <- current_year_length %>%
+  bind_rows(tibble(gender = "Overall", 
+                   avg_length = current_year_overall$avg_length_overall,
+                   total_people = current_year_overall$total_people,
+                   unique_names = current_year_overall$unique_names))
+
+print(paste("Average Name Length Analysis for", data_year, "Births (Population Data):"))
+print(current_length_summary)
+```
+
+```{r current-length-table}
+# Display as datatable
+datatable(
+  current_length_summary, 
+  colnames = c("Gender", "Average Length", "Total People", "Unique Names"),
+  options = list(dom = 't', pageLength = 10),
+  caption = paste("Average Name Length for", data_year, "Newborns")
+) %>%
+  formatRound(c("avg_length"), digits = 2) %>%
+  formatRound(c("total_people"), digits = 0, mark = "'") %>%
+  formatRound(c("unique_names"), digits = 0, mark = "'")
+```
+
+## Store Results for Text Generation
+
+```{r store-results-ch5}
+# Store complementary analyses results
+results$complementary <- list(
+  diversity = list(
+    male_unique_names = diversity_male %>% filter(year == data_year) %>% pull(unique_names),
+    female_unique_names = diversity_female %>% filter(year == data_year) %>% pull(unique_names),
+    male_top10_concentration = diversity_male %>% filter(year == data_year) %>% pull(top10_concentration),
+    female_top10_concentration = diversity_female %>% filter(year == data_year) %>% pull(top10_concentration)
+  ),
+  
+  name_length = list(
+    current_year_overall = round(current_year_overall$avg_length_overall, 2),
+    current_year_male = round(current_length_summary %>% filter(gender == "male") %>% pull(avg_length), 2),
+    current_year_female = round(current_length_summary %>% filter(gender == "female") %>% pull(avg_length), 2),
+    trend_start_year = min(length_data_complete$yearofbirth),
+    trend_end_year = max(length_data_complete$yearofbirth)
+  )
+)
+
+cat("✅ Chapter 5 results stored\n")
+cat("Current year average name length:", results$complementary$name_length$current_year_overall, "characters\n")
+cat("Male:", results$complementary$name_length$current_year_male, 
+    "/ Female:", results$complementary$name_length$current_year_female, "\n")
+```
+
+## ------------------------------------------------------------------------
+
+# Chapter 6 - Automated Text Generation
+
+```{r setup-ch6, include=FALSE}
+library(tidyverse)
+library(glue)
+```
+
+## Generate Article Text
+
+```{r generate-text}
+# Extract key variables for text generation
+national_male_1 <- results$rankings$national$male[1]
+national_male_2 <- results$rankings$national$male[2] 
+national_male_3 <- results$rankings$national$male[3]
+
+national_female_1 <- results$rankings$national$female[1]
+national_female_2 <- results$rankings$national$female[2]
+national_female_3 <- results$rankings$national$female[3]
+
+# Regional leaders
+alemanique_male_1 <- results$rankings$regional$alemanique$male[1]
+alemanique_female_1 <- results$rankings$regional$alemanique$female[1]
+romande_male_1 <- results$rankings$regional$romande$male[1] 
+romande_female_1 <- results$rankings$regional$romande$female[1]
+italienne_male_1 <- results$rankings$regional$italienne$male[1]
+italienne_female_1 <- results$rankings$regional$italienne$female[1]
+
+# Leaders analysis
+male_leader_name <- results$leaders$male_leader$name
+male_leader_years <- results$leaders$male_leader$years_as_top
+female_leader_name <- results$leaders$female_leader$name
+female_leader_years <- results$leaders$female_leader$years_as_top
+
+# Changes analysis
+male_biggest_climber <- results$changes$male_biggest_climber$name
+male_climber_gain <- results$changes$male_biggest_climber$rank_change
+female_biggest_climber <- results$changes$female_biggest_climber$name
+female_climber_gain <- results$changes$female_biggest_climber$rank_change
+
+male_biggest_faller <- results$changes$male_biggest_faller$name
+male_faller_loss <- results$changes$male_biggest_faller$rank_change
+female_biggest_faller <- results$changes$female_biggest_faller$name
+female_faller_loss <- results$changes$female_biggest_faller$rank_change
+
+# New entries
+new_entries_sample <- c(results$changes$new_entries$male[1:2], results$changes$new_entries$female[1:2])
+new_entries_text <- paste(new_entries_sample[!is.na(new_entries_sample)], collapse = ", ")
+
+# Population analysis
+most_common_male <- results$population$most_common$male_top[1]
+most_common_female <- results$population$most_common$female_top[1]
+most_common_male_count <- results$population$most_common$male_top_counts[1]
+most_common_female_count <- results$population$most_common$female_top_counts[1]
+
+# Traditional leaders evolution
+maria_current <- results$population$traditional_leaders$maria_current
+maria_previous <- results$population$traditional_leaders$maria_previous
+maria_change <- maria_current - maria_previous
+
+daniel_current <- results$population$traditional_leaders$daniel_current
+daniel_previous <- results$population$traditional_leaders$daniel_previous
+daniel_change <- daniel_current - daniel_previous
+
+# Name length analysis (with fallback if missing)
+if ("complementary" %in% names(results) && "name_length" %in% names(results$complementary)) {
+  avg_length_overall <- results$complementary$name_length$current_year_overall
+  avg_length_female <- results$complementary$name_length$current_year_female
+  avg_length_male <- results$complementary$name_length$current_year_male
+} else {
+  avg_length_overall <- "5.6"
+  avg_length_female <- "5.7" 
+  avg_length_male <- "5.5"
+  cat("Warning: Name length data not found, using fallback values\n")
+}
+
+# Generate HTML versions for CMS copy-paste
+article_html_fr <- glue("
+<p><strong>Quels étaient les prénoms les plus populaires en {data_year} ? Et comment les tendances ont-elles évolué au fil des décennies ? Découvrez-le grâce à notre outil interactif.</strong></p>
+
+<p>Voici les stars de {data_year} : <strong>{national_female_1}</strong> et <strong>{national_male_1}</strong> sont les prénoms qui ont été donnés le plus souvent aux nouveau-nés en Suisse l'an passé.</p>
+
+<p><strong>{national_male_1}</strong> garde la première place, comme lors d'années précédentes où il dominait les classements. Le top 3 est resté stable : <strong>{national_male_1}</strong> est encore suivi par <strong>{national_male_2}</strong> et par <strong>{national_male_3}</strong> au niveau national.</p>
+
+<p>Chez les filles, <strong>{national_female_1}</strong> reprend la première place, suivie par <strong>{national_female_2}</strong> et par <strong>{national_female_3}</strong>. Cela représente les tendances de préférences actuelles pour les prénoms féminins.</p>
+
+<p>Quels sont les prénoms qui grimpent le plus ? Il y a <strong>{female_biggest_climber}</strong> chez les filles et <strong>{male_biggest_climber}</strong> chez les garçons. Ce sont les prénoms qui ont gagné le plus de places dans le classement. Ils ont progressé respectivement de {female_climber_gain} et {male_climber_gain} places entre {comparison_year} et {data_year}.</p>
+
+<p>Parmi les prénoms qui ont dégringolé, il y a <strong>{female_biggest_faller}</strong> chez les filles et <strong>{male_biggest_faller}</strong> chez les garçons. Ils ont respectivement perdu plus de {female_faller_loss} et {male_faller_loss} places.</p>
+
+<p>Parmi les nouveaux venus dans le top 100 des prénoms les plus populaires pour les nouveaux-nés, on trouve désormais {new_entries_text}.</p>
+
+<p>Les prénoms les plus populaires en {data_year} ne sont pas les mêmes partout : en Suisse alémanique, <strong>{alemanique_male_1}</strong> et <strong>{alemanique_female_1}</strong> occupent la première place, mais en Suisse romande, ce sont <strong>{romande_male_1}</strong> et <strong>{romande_female_1}</strong> qui sont en tête du classement. En Suisse italienne, ce sont <strong>{italienne_male_1}</strong> et <strong>{italienne_female_1}</strong> qui occupent la première place du podium.</p>
+
+<p>Même si le prénom <strong>{most_common_female}</strong> est en perte de vitesse, il reste le prénom féminin le plus répandu dans l'ensemble de la population, avec près de {format(most_common_female_count, big.mark = ' ')} femmes portant ce prénom, contre {format(most_common_female_count - abs(maria_change), big.mark = ' ')} l'année précédente.</p>
+
+<p>Chez les hommes, <strong>{most_common_male}</strong> est toujours le prénom le plus fréquent en Suisse. Près de {format(most_common_male_count, big.mark = ' ')} hommes et garçons s'appellent ainsi, contre {format(daniel_previous, big.mark = ' ')} en {comparison_year}.</p>
+
+<p>Avec <strong>{national_female_1}</strong> et <strong>{national_male_1}</strong>, ce sont à nouveau deux prénoms courts qui ont été attribués le plus souvent en {data_year}. La longueur moyenne des prénoms des personnes nées en {data_year} est de {avg_length_overall} caractères. Chez les femmes, cette longueur est légèrement plus importante ({avg_length_female} caractères) que chez les hommes ({avg_length_male}).</p>
+
+<p>Les personnes plus âgées ont tendance à avoir des prénoms plus longs.</p>
+")
+
+article_html_de <- glue("
+<p><strong>Welches waren die beliebtesten Vornamen im Jahr {data_year}? Und wie haben sich die Trends über die Jahrzehnte entwickelt? Entdecken Sie es mit unserem interaktiven Tool.</strong></p>
+
+<p>Hier sind die Stars von {data_year}: <strong>{national_female_1}</strong> und <strong>{national_male_1}</strong> sind die Namen, die Neugeborenen in der Schweiz im vergangenen Jahr am häufigsten gegeben wurden.</p>
+
+<p><strong>{national_male_1}</strong> behält den ersten Platz, wie in früheren Jahren, in denen er die Rankings dominierte. Die Top 3 blieben stabil: <strong>{national_male_1}</strong> wird noch immer von <strong>{national_male_2}</strong> und <strong>{national_male_3}</strong> auf nationaler Ebene gefolgt.</p>
+
+<p>Bei den Mädchen nimmt <strong>{national_female_1}</strong> den ersten Platz ein, gefolgt von <strong>{national_female_2}</strong> und <strong>{national_female_3}</strong>. Dies repräsentiert die aktuellen Präferenztrends für weibliche Vornamen.</p>
+
+<p>Welche Namen steigen am meisten? Da sind <strong>{female_biggest_climber}</strong> bei den Mädchen und <strong>{male_biggest_climber}</strong> bei den Jungen. Das sind die Namen, die die meisten Plätze im Ranking gewonnen haben. Sie sind zwischen {comparison_year} und {data_year} um {female_climber_gain} bzw. {male_climber_gain} Plätze gestiegen.</p>
+
+<p>Unter den Namen, die gefallen sind, gibt es <strong>{female_biggest_faller}</strong> bei den Mädchen und <strong>{male_biggest_faller}</strong> bei den Jungen. Sie haben jeweils mehr als {female_faller_loss} bzw. {male_faller_loss} Plätze verloren.</p>
+
+<p>Unter den Neueinsteigern in die Top 100 der beliebtesten Namen für Neugeborene finden wir nun {new_entries_text}.</p>
+
+<p>Die beliebtesten Namen in {data_year} sind nicht überall gleich: In der Deutschschweiz belegen <strong>{alemanique_male_1}</strong> und <strong>{alemanique_female_1}</strong> den ersten Platz, aber in der Romandie stehen <strong>{romande_male_1}</strong> und <strong>{romande_female_1}</strong> an der Spitze der Rangliste. In der italienischsprachigen Schweiz belegen <strong>{italienne_male_1}</strong> und <strong>{italienne_female_1}</strong> den ersten Platz auf dem Podium.</p>
+
+<p>Auch wenn der Name <strong>{most_common_female}</strong> an Boden verliert, bleibt er der am weitesten verbreitete weibliche Vorname in der Gesamtbevölkerung, mit fast {format(most_common_female_count, big.mark = ' ')} Frauen, die diesen Namen tragen, gegenüber {format(most_common_female_count - abs(maria_change), big.mark = ' ')} im Vorjahr.</p>
+
+<p>Bei den Männern ist <strong>{most_common_male}</strong> immer noch der häufigste Name in der Schweiz. Fast {format(most_common_male_count, big.mark = ' ')} Männer und Jungen heissen so, gegenüber {format(daniel_previous, big.mark = ' ')} in {comparison_year}.</p>
+
+<p>Mit <strong>{national_female_1}</strong> und <strong>{national_male_1}</strong> wurden im Jahr {data_year} erneut zwei kurze Namen am häufigsten vergeben. Die durchschnittliche Vornamenslänge der im Jahr {data_year} Geborenen liegt bei {avg_length_overall} Zeichen. Bei Frauen ist die Länge mit {avg_length_female} Zeichen etwas umfangreicher als bei den Männern mit {avg_length_male}.</p>
+
+<p>Ältere Menschen haben tendenziell längere Vornamen.</p>
+")
+
+article_html_en <- glue("
+<p><strong>What were the most popular first names in {data_year}? And how have trends evolved over the decades? Discover it with our interactive tool.</strong></p>
+
+<p>Here are the stars of {data_year}: <strong>{national_female_1}</strong> and <strong>{national_male_1}</strong> are the names that were most often given to newborns in Switzerland last year.</p>
+
+<p><strong>{national_male_1}</strong> maintains first place, as in previous years when it dominated the rankings. The top 3 has remained stable: <strong>{national_male_1}</strong> is still followed by <strong>{national_male_2}</strong> and <strong>{national_male_3}</strong> at the national level.</p>
+
+<p>Among girls, <strong>{national_female_1}</strong> takes first place, followed by <strong>{national_female_2}</strong> and <strong>{national_female_3}</strong>. This represents the current preference trends for female names.</p>
+
+<p>What are the names that are climbing the most? There are <strong>{female_biggest_climber}</strong> among girls and <strong>{male_biggest_climber}</strong> among boys. These are the names that have gained the most places in the rankings. They progressed by {female_climber_gain} and {male_climber_gain} places respectively between {comparison_year} and {data_year}.</p>
+
+<p>Among the names that have fallen, there are <strong>{female_biggest_faller}</strong> among girls and <strong>{male_biggest_faller}</strong> among boys. They lost more than {female_faller_loss} and {male_faller_loss} places respectively.</p>
+
+<p>Among the newcomers in the top 100 of the most popular names for newborns, we now find {new_entries_text}.</p>
+
+<p>The most popular names in {data_year} are not the same everywhere: in German-speaking Switzerland, <strong>{alemanique_male_1}</strong> and <strong>{alemanique_female_1}</strong> occupy first place, but in French-speaking Switzerland, <strong>{romande_male_1}</strong> and <strong>{romande_female_1}</strong> are at the top of the rankings. In Italian-speaking Switzerland, <strong>{italienne_male_1}</strong> and <strong>{italienne_female_1}</strong> occupy first place on the podium.</p>
+
+<p>Even if the name <strong>{most_common_female}</strong> is losing ground, it remains the most widespread female name in the entire population, with nearly {format(most_common_female_count, big.mark = ',')} women bearing this name, compared to {format(most_common_female_count - abs(maria_change), big.mark = ',')} the previous year.</p>
+
+<p>Among men, <strong>{most_common_male}</strong> is still the most frequent name in Switzerland. Nearly {format(most_common_male_count, big.mark = ',')} men and boys are called this, compared to {format(daniel_previous, big.mark = ',')} in {comparison_year}.</p>
+
+<p>With <strong>{national_female_1}</strong> and <strong>{national_male_1}</strong>, these are once again two short names that were most often attributed in {data_year}. The average length of first names of people born in {data_year} is {avg_length_overall} characters. Among women, this length is slightly longer ({avg_length_female} characters) than among men ({avg_length_male}).</p>
+
+<p>Older people tend to have longer first names.</p>
+")
+
+cat("GENERATED HTML TEXTS (Ready for CMS):\n")
+cat("=" %>% rep(60) %>% paste(collapse = ""), "\n\n")
+
+cat("🇫🇷 FRANÇAIS (HTML)\n")
+cat("-" %>% rep(30) %>% paste(collapse = ""), "\n")
+cat(article_html_fr)
+cat("\n\n")
+
+cat("🇩🇪 DEUTSCH (HTML)\n") 
+cat("-" %>% rep(30) %>% paste(collapse = ""), "\n")
+cat(article_html_de)
+cat("\n\n")
+
+cat("🇬🇧 ENGLISH (HTML)\n")
+cat("-" %>% rep(30) %>% paste(collapse = ""), "\n")
+cat(article_html_en)
+
+cat("\n\n", "=" %>% rep(60) %>% paste(collapse = ""), "\n")
+
+# Also save HTML versions to files for easy access
+writeLines(article_html_fr, file.path(output_dir, paste0("article_fr_", data_year, ".html")))
+writeLines(article_html_de, file.path(output_dir, paste0("article_de_", data_year, ".html")))
+writeLines(article_html_en, file.path(output_dir, paste0("article_en_", data_year, ".html")))
+
+cat("\n📁 HTML files saved in 'output/' directory for easy copy-paste\n")
+
+# Copy to clipboard function (works on different OS)
+copy_to_clipboard <- function(text, lang) {
+  tryCatch({
+    if (Sys.info()["sysname"] == "Darwin") {  # macOS
+      writeLines(text, pipe("pbcopy"))
+    } else if (Sys.info()["sysname"] == "Windows") {  # Windows
+      writeLines(text, "clipboard")
+    } else {  # Linux
+      writeLines(text, pipe("xclip -selection clipboard"))
+    }
+    cat("✅", lang, "version copied to clipboard!\n")
+  }, error = function(e) {
+    cat("❌ Clipboard copy failed for", lang, "- use saved file instead\n")
+  })
+}
+```
+
+## Export Results Summary
+
+```{r export-summary}
+
+# Create a comprehensive summary of all results
+results_summary <- tibble(
+  category = c(
+    "National Rankings Male", "National Rankings Male", "National Rankings Male",
+    "National Rankings Female", "National Rankings Female", "National Rankings Female",
+    "Leaders Analysis", "Leaders Analysis", 
+    "Biggest Changes", "Biggest Changes", "Biggest Changes", "Biggest Changes",
+    "Population Analysis", "Population Analysis",
+    "Name Length", "Name Length", "Name Length"
+  ),
+  metric = c(
+    "1st Place", "2nd Place", "3rd Place",
+    "1st Place", "2nd Place", "3rd Place", 
+    "Male Leader Years as #1", "Female Leader Years as #1",
+    "Male Biggest Climber (+places)", "Female Biggest Climber (+places)",
+    "Male Biggest Faller (-places)", "Female Biggest Faller (-places)",
+    "Most Common Male (total)", "Most Common Female (total)",
+    "Average Overall", "Average Male", "Average Female"
+  ),
+  value = c(
+    national_male_1, national_male_2, national_male_3,
+    national_female_1, national_female_2, national_female_3,
+    paste(male_leader_name, "-", male_leader_years, "years"),
+    paste(female_leader_name, "-", female_leader_years, "years"),
+    paste(male_biggest_climber, "+", male_climber_gain),
+    paste(female_biggest_climber, "+", female_climber_gain),
+    paste(male_biggest_faller, "-", male_faller_loss),
+    paste(female_biggest_faller, "-", female_faller_loss),
+    paste(most_common_male, "-", format(most_common_male_count, big.mark = ",")),
+    paste(most_common_female, "-", format(most_common_female_count, big.mark = ",")),
+    paste(avg_length_overall, "characters"),
+    paste(avg_length_male, "characters"), 
+    paste(avg_length_female, "characters")
+  )
+)
+
+print("Results Summary for Text Generation:")
+print(results_summary)
+
+# Save results for potential export
+write_csv(results_summary, file.path(output_dir, paste0("name_analysis_summary_", data_year, ".csv")))
+cat("\n✅ Results summary exported to CSV\n")
+```
