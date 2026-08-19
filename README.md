@@ -4,19 +4,29 @@
 
 Downloads Swiss baby-name data (newborn rankings + total living population),
 computes rankings and year-over-year changes, and generates ready-to-paste
-article text in French, German and English, plus a handful of CSV/HTML
-tables (top climbers/fallers, national & regional podiums, most common
-names).
+article text in French and German, plus a handful of CSV/HTML tables (top
+climbers/fallers, national & regional podiums, most common names).
 
 The pipeline is a single Python script: `00_data/babynames_script.py`.
 The original R/Quarto version (`00_data/babynames_script.qmd`) is kept for
 reference but is no longer the one to run.
 
+**The text is the deliverable; the tables are backup.** The target CMS takes
+plain text, not HTML, so the generated article text has no HTML tags at all -
+first names are marked with `**bold**` (Markdown-style) instead, which gets
+converted to real `<strong>` tags in the HTML output so that copying from a
+browser (or from a Claude chat response with the same text pasted in) carries
+bold through the rich-text clipboard into the CMS. See "Rich-text copy-paste"
+below.
+
 ## Data Sources
 
-- **PX Web API**: Newborn names by region and year — stable endpoint, never needs updating.
-- **Swiss Federal Statistical Office (BFS) DAM API**: Total living population by name —
-  auto-discovered every run, no manual URLs. See "How the population data is fetched" below.
+- **PX Web API** (newborn names by region and year): queried directly via the
+  standard PXWebAPI (JSON-stat2 format), not the CSV "saved query" shortlink.
+  See "Why the PXWebAPI and not a CSV export" below - this matters for accented names.
+- **Swiss Federal Statistical Office (BFS) DAM API** (total living population
+  by name): auto-discovered every run, no manual URLs. See "How the
+  population data is fetched" below.
 
 ## Setup
 
@@ -35,6 +45,28 @@ That's it — no Jupyter, no R, no system libraries.
 `DATA_YEAR` (the reference year for the whole analysis) is **not** based on
 today's date — it's auto-detected as the most recent year present in the PX
 Web newborn data, since BFS publishes final figures with a lag.
+
+### Why the PXWebAPI and not a CSV export
+
+The CSV "saved query" shortlink (what the R script and an early version of
+this one used) forces the server to encode the file in a single-byte charset
+(`iso-8859-15`). That charset cannot represent every character Swiss-registered
+names actually use - e.g. Czech/Slovak "š" in "Eliška" comes back as a
+mangled placeholder (`Eli¨ka`), even though the underlying BFS data is correct
+(confirmed by downloading the same table as XLSX from the PX Web website,
+which shows it correctly - XLSX is Unicode-native).
+
+The fix: query the standard PXWebAPI (`/api/v1/fr/<table>/<table>.px`, POST,
+`response.format: "json-stat2"`) instead. JSON-stat2 is UTF-8 natively, so
+this isn't a workaround, it's just the correct data source. Two side notes
+baked into `import_px_data()`:
+
+- The API caps a single query around 100k cells, and one region already uses
+  ~2/3 of that (2668 names × 25 years), so the script queries **one region at
+  a time** (4 regions × 2 genders = 8 requests) rather than all 4 in one call.
+- The query also filters server-side to the "Nombre" (count) unit only, since
+  the script always recomputes its own tie-free rank rather than using BFS's
+  "Rang" unit - this cuts the amount of data transferred too.
 
 ### How the population data is fetched
 
@@ -71,16 +103,23 @@ python babynames_script.py
 
 Output is written to `00_data/output/<data_year>/`:
 
-- `article_fr_YYYY.html`, `article_de_YYYY.html`, `article_en_YYYY.html` —
-  the generated article text, ready to copy-paste into the CMS. Each includes
-  section headings and, right after the climbers/fallers paragraphs, a
-  compact HTML table of the top 5 gainers/losers per gender (10 names total)
-  — more detail than the prose gives on its own.
-- `report_YYYY.html` — a single page combining all three article texts with
-  every table below, for a quick visual review before publishing. **Open this one first.**
-- `climbers_YYYY.csv`, `fallers_YYYY.csv` — biggest rank gainers/losers, national ranking, 10 per gender.
-- `rank_changes_full_YYYY.csv` — every name in the analysis pool (name, gender,
-  rank_prev, rank_current, rank_change, counts, status), not just the top movers.
+- `article_fr_YYYY.html`, `article_de_YYYY.html` — one page per language,
+  split into sections: a heading, then a highlighted text block (the actual
+  copy, first names in bold, no other markup), then that section's tables.
+  Open in a browser and copy each text block directly into the CMS.
+- `report_YYYY.html` — both languages one after another on a single page,
+  plus a few full reference tables at the end, for a quick overview before
+  publishing. **Open this one first.**
+- `data_quality_log_YYYY.txt` — encoding check, PX-vs-population freshness
+  check, and a manual-review reminder (see "Data quality checks" below).
+  Also printed to the console on every run.
+- `climbers_YYYY.csv`, `fallers_YYYY.csv` — biggest rank gainers/losers
+  within the top `CLIMBER_RANK_CEILING` (200), national ranking, 10 per gender.
+- `rank_changes_full_YYYY.csv` — every name in the analysis pool (name,
+  gender, rank_prev, rank_current, rank_change, counts, status), not just the
+  top movers or the top-200 pool.
+- `evolution_male_YYYY.csv`, `evolution_female_YYYY.csv` — the 10-year rank
+  history behind the evolution table, one column per year.
 - `new_entries_YYYY.csv`, `exits_YYYY.csv` — names entering/leaving the national top 100.
 - `rankings_national_YYYY.csv`, `rankings_regional_YYYY.csv` — top 3 podiums.
 - `most_common_YYYY.csv`, `biggest_population_increases_YYYY.csv`, `biggest_population_decreases_YYYY.csv` — total living population analysis.
@@ -89,39 +128,109 @@ Raw downloads are cached in `00_data/input/raw/` (git-ignored). Set
 `FORCE_REDOWNLOAD = False` at the top of the script to reuse them between runs
 while iterating locally.
 
+## Rich-text copy-paste
+
+The CMS accepts pasted rich text (bold preserved) but not raw HTML tags typed
+as text. So the article HTML never shows a literal `<strong>` - the text
+blocks embed real, unescaped `<strong>` elements (see `markdown_bold_to_html()`),
+and selecting + copying that block from a rendered browser page carries the
+bold through the browser's rich-text (`text/html`) clipboard representation.
+
+The same `**name**` markers are what a Claude chat response uses to render
+bold directly in the conversation - so pasting the article text into a chat
+message and asking for it back, or having Claude generate it directly in a
+reply, works the same way: copying the rendered chat bubble carries bold into
+the CMS too, without needing to open a file first.
+
 ## Script Structure
 
-- **Config**: paths, thresholds, DAM API content ids.
-- **Import**: PX Web (newborn rankings) + BFS DAM population snapshots (auto-discovered), with encoding and year-mismatch sanity checks.
-- **Rankings**: national/regional top 3, tie-free custom rank.
+- **Config**: paths, thresholds, PXWebAPI table IDs, DAM API content ids.
+- **Import**: PX Web (newborn rankings, via PXWebAPI/JSON-stat2) + BFS DAM
+  population snapshots (auto-discovered).
+- **Data quality checks**: see below — run once, after both datasets are loaded.
+- **Rankings**: national/regional top 3, tie-free custom rank, 10-year evolution of today's top 10.
 - **Rank changes**: climbers, fallers, new entries, exits (year-over-year).
 - **Population analysis**: most common names overall, biggest population swings.
-- **Name length**: average first-name length for the reference year's births (two methodologies - see below).
-- **Text generation**: FR/DE/EN article text, with embedded top-movers tables.
-- **Export**: HTML articles, combined HTML report, CSV tables.
+- **Name length**: average first-name length for the reference year's births.
+- **Text generation**: FR/DE article sections (heading + plain-text-with-bold
+  block + tables), including the "years as #1" leader-continuity narrative.
+- **Export**: HTML article pages, combined HTML report, CSV tables, data quality log.
 
-## Average name length: two different numbers, both correct
+## Data quality checks
 
-The article quotes two figures, because "average name length" is ambiguous:
+Every run performs checks and writes them to `data_quality_log_YYYY.txt`
+(and prints them to the console):
 
-- **Weighted by births** (primary figure): the length a randomly picked
-  newborn actually has. Short, popular names like Emma/Noah pull this down.
-- **Unweighted**: the simple mean across the roster of *distinct* names given
-  that year — Aliénor and Emma each count once, regardless of how many babies
-  got that name.
+1. **Encoding.** Flags names containing characters that indicate a likely
+   decoding problem — the Unicode replacement character, a stray diacritic
+   with no base letter (e.g. a leftover `Eli¨ka` if the data source ever
+   regresses), or digits. Deliberately does **not** flag apostrophes, hyphens
+   or spaces, since those are legitimate in real Swiss-registered names
+   (`N'Guessan`, `Jean-Pierre`). This should normally come back clean now
+   that PX Web data is fetched via the PXWebAPI (see "Why the PXWebAPI and
+   not a CSV export" above) - if it isn't, that's worth investigating, not ignoring.
+2. **PX Web vs. population census freshness.** PX Web (newborn rankings) and
+   the population census are two independent BFS datasets. This check confirms
+   the population census actually has rows for `yearofbirth == DATA_YEAR` (the
+   year PX Web says is the latest) — if not, the census hasn't caught up yet,
+   and any figure derived from it (most common name, name length) is flagged
+   as unreliable rather than silently used.
+3. **Manual review reminder.** Two paragraphs in `build_article_sections()`
+   are static text, never re-verified against data: the name-diversity/
+   individualisation trend (references 1980, but PX Web only goes back to
+   2000) and the "as shown by our maps" sentence (the script doesn't generate
+   maps). The log just reprints a reminder to skim them each year.
 
-These can differ by half a character or more (e.g. 5.16 vs. 5.59 in 2024).
-The original R script's code comment claimed to compute the unweighted
-version but the code actually computed the weighted one — if last year's
-published figure looks different from this year's, that's why.
+## Climbers/fallers: a rank ceiling, not a minimum count
+
+`CLIMBER_RANK_CEILING = 200` restricts "biggest movers" to names ranked
+within the national top 200 in *both* years. This was deliberately chosen
+over filtering by a minimum birth count: within the top 200, counts are
+already comfortably high (rank 200 ≈ 36 births), so tiny-sample noise (a name
+going from 1 to 3 births swinging wildly in rank) isn't a risk, and the
+resulting climbers/fallers are still described with modest wording ("de
+belles progressions" / "legten spürbar zu") rather than superlatives, since
+within a 200-name pool they aren't necessarily the single most extreme swing
+in the full ~2600-name dataset - just a notable one within a meaningful pool.
+`rank_changes_full_YYYY.csv` has no such ceiling, if a wider view is ever wanted.
+
+## Average name length
+
+The article reports one figure: the **unweighted** mean length across the
+roster of distinct names given that year (each name counts once, regardless
+of how many babies got it) - this is what the real published reference
+articles use. `name_length_summary()` also computes a **weighted** version
+(length as experienced by a randomly picked newborn, pulled down by short
+popular names like Emma/Noah) for reference, but it's not currently used in
+the generated text. The two can differ by half a character or more.
+
+## Troubleshooting
+
+- A PX Web query failure usually means BFS changed the table ID or variable
+  codes — the error message names the table/region. Check
+  `https://www.pxweb.bfs.admin.ch/api/v1/fr/<table_id>/<table_id>.px` (GET,
+  no body) in a browser to see the current variable codes and re-derive the query.
+- A `403 Forbidden` from the PXWebAPI with no clear message usually means a
+  single query exceeded the ~100k-cell limit — this shouldn't happen with the
+  current one-region-at-a-time queries, but would if a region were added
+  without splitting further.
+- A population download/resolution failure means BFS restructured their DAM
+  catalog (rare) — check the content ids in `POPULATION_CONTENT_IDS` still
+  resolve by visiting `https://dam-api.bfs.admin.ch/hub/api/dam/assets/<content_id>:latest:fr` in a browser.
+- A "previous edition is stale" warning means `bfs_population_state.json` is
+  more than a year old (the script wasn't run last year) — either accept the
+  wider comparison window, or delete the file to fall back to the seed value.
+- Check `data_quality_log_YYYY.txt` for names with unexpected characters —
+  should be empty now (see "Why the PXWebAPI and not a CSV export"); if
+  something shows up, it's worth a look rather than assuming it's expected.
 
 ## Notes on the R → Python conversion
 
 A few things from the original R/Quarto script were deliberately dropped or fixed:
 
-- Removed the interactive Plotly heatmaps and the "years as #1 leader" /
-  name-diversity analyses — none of them fed into the final article text or
-  the climbers/fallers tables, so they were dead weight.
+- Removed the interactive Plotly heatmaps - replaced by a plain-text-friendly
+  10-year rank evolution table, which the R version never actually used in
+  its article text.
 - Fixed a real bug: the R script hardcoded "Maria"/"Daniel" to compute the
   previous-year count of the most common names. If a different name ever
   becomes the most common, that logic would silently report the wrong
@@ -129,26 +238,7 @@ A few things from the original R/Quarto script were deliberately dropped or fixe
   own previous-year count.
 - `DATA_YEAR` is now detected from the data itself instead of `today - 1`,
   since BFS may not have published the most recent year yet when the script runs.
-- Dropped the clipboard-copy helper (unreliable across OSes) — the HTML
-  report is easier to copy from directly.
 - Replaced the four manually-updated population URLs with automatic
-  discovery via the BFS DAM API (see "How the population data is fetched" above) —
-  this was the last remaining annual manual step, and it's now gone.
-- The name-length figure silently changed methodology between the R comment
-  and the R code (see "Average name length" above) — the Python version
-  reports both explicitly instead of picking one silently.
-
-## Troubleshooting
-
-- A PX Web download failure usually means BFS changed that endpoint — the
-  error message names the offending URL.
-- A population download/resolution failure means BFS restructured their DAM
-  catalog (rare) — check the content ids in `POPULATION_CONTENT_IDS` still
-  resolve by visiting `https://dam-api.bfs.admin.ch/hub/api/dam/assets/<content_id>:latest:fr` in a browser.
-- A "previous edition is stale" warning means `bfs_population_state.json` is
-  more than a year old (the script wasn't run last year) — either accept the
-  wider comparison window, or delete the file to fall back to the seed value.
-- Check the "encoding sanity check" output after import for names with
-  unexpected characters — BFS serves the PX Web export as Windows-1252,
-  which can't represent every diacritic (e.g. Czech `š`/`č`); this is a
-  source-data limitation, not a script bug.
+  discovery via the BFS DAM API — the last remaining annual manual step, now gone.
+- Replaced the CSV "saved query" PX Web download (lossy for some accented
+  names) with the PXWebAPI directly.

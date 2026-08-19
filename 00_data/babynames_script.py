@@ -3,17 +3,19 @@ Swiss First Names Analysis - Automated Annual Report
 Author: Olaf Koenig
 
 Downloads newborn-name rankings (PX Web, automatic) and total-population
-name counts (BFS assets, manual URLs) for Switzerland, computes rankings,
-year-over-year changes and a few key stats, then generates ready-to-paste
-article text in FR/DE/EN plus a handful of CSV/HTML tables.
+name counts (BFS DAM API, auto-discovered) for Switzerland, computes
+rankings, year-over-year changes and a few key stats, then generates
+ready-to-paste article text in FR/DE/EN plus a handful of CSV/HTML tables.
 
 Requirements: Python 3.8+, pandas, requests (see requirements.txt).
 Run with:     python babynames_script.py
 """
 
+import io
 import json
 import re
 import unicodedata
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -30,10 +32,21 @@ import requests
 DATA_YEAR = None
 COMPARISON_YEAR = None
 
-# How many ranks to look at when computing climbers/fallers/new entries.
-TOP_N_ANALYSIS = 200   # pool used to compute rank changes (climbers/fallers)
+# How many ranks to look at when computing new entries/exits. Climbers/fallers
+# have no such cap (see build_rank_changes) - a name can validly jump from
+# e.g. rank 583 to rank 167.
 TOP_N_DISPLAY = 100    # threshold used for "new entry" / "exit" from the top
-TOP_N_MOVERS_IN_ARTICLE = 5  # climbers/fallers shown per gender in the article's own tables
+TOP_N_MOVERS_IN_ARTICLE = 5     # climbers/fallers shown per gender in the article's own tables
+TOP_N_NEW_ENTRIES_IN_ARTICLE = 5  # new top-100 entries shown per gender in the article
+
+# A name must be ranked within this pool in BOTH years to be eligible as a
+# climber/faller - keeps tiny-sample noise (e.g. 1 birth -> 3 births, deep in
+# the tail) from dominating "biggest movers", see climbers_and_fallers().
+CLIMBER_RANK_CEILING = 200
+
+# National top-N-names-over-N-years evolution table (first article section).
+EVOLUTION_N_NAMES = 10
+EVOLUTION_N_YEARS = 10
 
 # Re-download files even if they already exist locally for this run.
 # Set to False while iterating locally to avoid hammering the BFS servers.
@@ -59,12 +72,23 @@ OUTPUT_DIR = None
 for directory in (INPUT_RAW_DIR, INPUT_PROCESSED_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
-# PX Web (automatic - full historical newborn-name series, stable endpoint,
-# never needs updating).
-URLS = {
-    "px_female": "https://www.pxweb.bfs.admin.ch/sq/ea826a26-7e80-4906-a4f2-d89a145cd19e",
-    "px_male": "https://www.pxweb.bfs.admin.ch/sq/7a95b4e9-f6d8-49cc-858d-cea658ac3a2b",
-}
+# PX Web (automatic - full historical newborn-name series, stable table IDs,
+# never need updating). Uses the standard PXWebAPI v1 (JSON-stat2, native
+# Unicode) rather than the "saved query" CSV shortlink: the CSV export is
+# forced to a single-byte charset (iso-8859-15) server-side, which cannot
+# represent some real Swiss names (e.g. Czech/Slovak "š" in "Eliška") - the
+# API doesn't have that problem, and also lets us ask for only the regions
+# and unit-of-measure we actually use instead of downloading everything.
+PX_API_BASE = "https://www.pxweb.bfs.admin.ch/api/v1/fr"
+PX_TABLE_IDS = {"female": "px-x-0104050000_102", "male": "px-x-0104050000_101"}
+# BFS's internal codes for the 4 regions we use (Suisse = NATIONAL_REGION,
+# the other 3 = LINGUISTIC_REGIONS below) and for "Nombre" (counts, as
+# opposed to "Rang" which we never use since custom_rank is computed ourselves).
+PX_REGION_CODES = {"Suisse": "CH", "Suisse alémanique": "DD", "Suisse romande": "FF", "Suisse italienne": "II"}
+PX_COUNT_UNIT_CODE = "C"
+# The PXWebAPI backend caps a single query around 100k cells (2668 names x 25
+# years already uses ~2/3 of that) - one query per region keeps every request
+# comfortably under the limit instead of hitting a generic 403.
 
 # Total-population-by-name snapshots (used for "most common name overall").
 # No manual URL to maintain: BFS assigns each dataset a stable contentId that
@@ -118,6 +142,24 @@ def download(url: str, dest_path: Path) -> None:
     dest_path.write_bytes(response.content)
 
 
+def read_csv_robust_encoding(path: Path) -> tuple:
+    """Used for the population snapshots (DAM API), which are UTF-8. Tries
+    UTF-8 first and only falls back to Windows-1252 if that fails outright -
+    self-verifying, since real Windows-1252 bytes containing accented
+    characters almost never happen to also form valid UTF-8. (PX Web data no
+    longer goes through this path - see import_px_data(), which uses the
+    PXWebAPI JSON-stat2 format instead of the CSV export precisely because
+    that CSV export is forced to a lossy single-byte charset server-side.)"""
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+        encoding_used = "UTF-8"
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252")
+        encoding_used = "Windows-1252 (UTF-8 decoding failed)"
+    return pd.read_csv(io.StringIO(text)), encoding_used
+
+
 def resolve_latest_population_asset(content_id: int, lang: str = "fr") -> dict:
     """Auto-discovers this year's population-by-name snapshot via the BFS DAM
     API. contentId identifies the dataset lineage and never changes; damId
@@ -160,35 +202,112 @@ def save_population_state(state: dict) -> None:
     POPULATION_STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def import_px_data(url: str, filename_base: str) -> pd.DataFrame:
-    """PX Web export: comma-separated, Windows-1252 encoded. Always the full
-    historical series, so there's no year to pin the filename to."""
-    dest_path = INPUT_RAW_DIR / f"{filename_base}.csv"
-    print(f"Downloading {dest_path.name} ...")
-    download(url, dest_path)
-    df = pd.read_csv(dest_path, encoding="cp1252")
-    df = clean_names(df)
-    print(f"  imported {len(df):,} rows")
+def fetch_px_json_stat(table_id: str, region_code: str) -> dict:
+    """One region at a time (see PX_REGION_CODES comment above for why)."""
+    url = f"{PX_API_BASE}/{table_id}/{table_id}.px"
+    query = {
+        "query": [
+            {"code": "Vorname", "selection": {"filter": "all", "values": ["*"]}},
+            {"code": "Sprachregion / Kanton", "selection": {"filter": "item", "values": [region_code]}},
+            {"code": "Masseinheit", "selection": {"filter": "item", "values": [PX_COUNT_UNIT_CODE]}},
+            {"code": "Jahr", "selection": {"filter": "all", "values": ["*"]}},
+        ],
+        "response": {"format": "json-stat2"},
+    }
+    try:
+        response = requests.post(url, json=query, timeout=60)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"PX Web API query failed for table {table_id}, region {region_code}.\n"
+            f"Original error: {exc}"
+        ) from exc
+    return response.json()
+
+
+def json_stat_to_long_df(payload: dict, region_label: str, gender: str) -> pd.DataFrame:
+    """Flattens one JSON-stat2 cube (dims: Vorname x region x unit x Jahr,
+    with region/unit fixed to a single value by the query) into a long
+    dataframe: prenom, region_linguistique_canton, year, value, gender.
+    Written generically against dimension order/sizes rather than assuming
+    this table's exact shape, so a harmless BFS reordering wouldn't break it."""
+    dims = payload["id"]
+    sizes = payload["size"]
+    values = payload["value"]
+
+    categories = []
+    for dim in dims:
+        cat = payload["dimension"][dim]["category"]
+        labels = cat["label"]
+        index = cat.get("index")
+        if index is None:
+            categories.append([next(iter(labels.values()))])
+        else:
+            pos_to_code = {pos: code for code, pos in index.items()}
+            categories.append([labels[pos_to_code[i]] for i in range(len(pos_to_code))])
+
+    name_dim, year_dim = dims.index("Vorname"), dims.index("Jahr")
+
+    rows = []
+    for flat_i, value in enumerate(values):
+        if value is None:
+            continue
+        remainder, coords = flat_i, [0] * len(dims)
+        for d in range(len(dims) - 1, -1, -1):
+            coords[d] = remainder % sizes[d]
+            remainder //= sizes[d]
+        rows.append((categories[name_dim][coords[name_dim]], int(categories[year_dim][coords[year_dim]]), value))
+
+    df = pd.DataFrame(rows, columns=["prenom", "year", "value"])
+    df["region_linguistique_canton"] = region_label
+    df["gender"] = gender
     return df
 
 
-def import_population_data(url: str, filename_base: str, year: int, gender: str) -> pd.DataFrame:
-    """BFS asset CSV: comma-separated, UTF-8 (with BOM)."""
+def import_px_data(gender: str) -> pd.DataFrame:
+    """All 4 regions we use, for one gender, via the PX Web API (see
+    PX_TABLE_IDS/PX_REGION_CODES above)."""
+    table_id = PX_TABLE_IDS[gender]
+    frames = []
+    for region_label, region_code in PX_REGION_CODES.items():
+        cache_path = INPUT_RAW_DIR / f"px_{gender}_{region_code}.json"
+        if cache_path.exists() and not FORCE_REDOWNLOAD:
+            print(f"  (skip download, already have {cache_path.name})")
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        else:
+            print(f"Querying PX Web API: {gender} / {region_label} ...")
+            payload = fetch_px_json_stat(table_id, region_code)
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        frames.append(json_stat_to_long_df(payload, region_label, gender))
+    df = pd.concat(frames, ignore_index=True)
+    print(f"  imported {len(df):,} rows for {gender} (native UTF-8, no encoding fallback needed)")
+    return df
+
+
+def import_population_data(url: str, filename_base: str, year, gender: str) -> pd.DataFrame:
     dest_path = INPUT_RAW_DIR / f"{filename_base}_{year}.csv"
     print(f"Downloading {dest_path.name} ...")
     download(url, dest_path)
-    df = pd.read_csv(dest_path, encoding="utf-8-sig")
+    df, encoding_used = read_csv_robust_encoding(dest_path)
     df = clean_names(df)
     df["gender"] = gender
     df = df.drop(columns=["obs_status"], errors="ignore")
-    print(f"  imported {len(df):,} rows")
+    print(f"  imported {len(df):,} rows (decoded as {encoding_used})")
     return df
 
 
-def check_encoding(df: pd.DataFrame, column: str) -> pd.Series:
-    """Names containing anything other than letters/hyphens - quick data-quality check."""
+# Characters that indicate a likely encoding problem: the Unicode replacement
+# character (a decode failure), stray/lone diacritics with no base letter to
+# attach to (the classic symptom of an accented character lost in translation,
+# e.g. "Eli¨ka" instead of "Eliška"), and digits. Deliberately does NOT flag
+# apostrophes, hyphens or spaces, which are legitimate in real Swiss-registered
+# names (e.g. "N'Guessan", "Jean-Pierre", "Anne Sophie").
+SUSPICIOUS_NAME_PATTERN = re.compile(r"[�¨´`^~¸°\d]")
+
+
+def check_name_encoding(df: pd.DataFrame, column: str) -> pd.Series:
     values = df[column].dropna().astype(str)
-    suspicious = values[values.str.contains(r"[^A-Za-zÀ-ÿ\-]", regex=True)]
+    suspicious = values[values.str.contains(SUSPICIOUS_NAME_PATTERN, regex=True)]
     return pd.Series(sorted(suspicious.unique()))
 
 
@@ -197,17 +316,9 @@ def check_encoding(df: pd.DataFrame, column: str) -> pd.Series:
 # =============================================================================
 
 def load_px_data():
-    print("\n=== Importing newborn-name data (PX Web) ===\n")
-    px_female = import_px_data(URLS["px_female"], "px_names_female")
-    px_male = import_px_data(URLS["px_male"], "px_names_male")
-
-    print("\n--- Encoding sanity check (names with unexpected characters) ---")
-    for label, df in [("PX female", px_female), ("PX male", px_male)]:
-        suspicious = check_encoding(df, "prenom")
-        if len(suspicious):
-            print(f"  {label}: {list(suspicious)}")
-    print("  done (no output above = nothing suspicious)\n")
-
+    print("\n=== Importing newborn-name data (PX Web API) ===\n")
+    px_female = import_px_data("female")
+    px_male = import_px_data("male")
     return px_female, px_male
 
 
@@ -253,12 +364,6 @@ def load_population_data():
             f"  {gender}: current edition {current['period']} (damId {current['dam_id']}), "
             f"previous edition {previous['period']} (damId {previous['dam_id']}, from local state)"
         )
-        if int(current["period"]) != DATA_YEAR:
-            print(
-                f"  NOTE: the {gender} population snapshot is for {current['period']}, while the "
-                f"newborn data points to {DATA_YEAR} as the reference year (BFS publishes these on "
-                f"different schedules). Population figures in the article will refer to {current['period']}."
-            )
         if int(current["period"]) - int(previous["period"]) != 1:
             print(
                 f"  WARNING: the {gender} previous edition is {previous['period']}, expected "
@@ -274,14 +379,74 @@ def load_population_data():
     save_population_state(next_state)
     print(f"  (updated {POPULATION_STATE_FILE.name})\n")
 
-    print("--- Encoding sanity check (names with unexpected characters) ---")
-    for label, df in [("Population female", frames["all_female_current"]), ("Population male", frames["all_male_current"])]:
-        suspicious = check_encoding(df, "firstname")
-        if len(suspicious):
-            print(f"  {label}: {list(suspicious)}")
-    print("  done (no output above = nothing suspicious)\n")
-
     return frames
+
+
+# =============================================================================
+# DATA QUALITY CHECKS (encoding + cross-source year consistency)
+# =============================================================================
+
+def run_data_quality_checks(px_female: pd.DataFrame, px_male: pd.DataFrame, population_frames: dict) -> list:
+    """Two independent checks, both printed AND saved to a log file so they
+    can be reviewed after the fact instead of scrolling back through console
+    output:
+    1. Encoding: do any names contain characters that suggest a decoding
+       problem, as opposed to unusual-but-legitimate characters?
+    2. Freshness: PX Web's most recent year (DATA_YEAR) is one BFS dataset;
+       the population census is a completely independent one. If the census
+       doesn't yet have any rows for DATA_YEAR births, that's a sign PX Web
+       is ahead of the census - worth knowing before trusting figures that
+       depend on it (most common name, name length)."""
+    lines = [f"Data quality report - data year {DATA_YEAR}", ""]
+
+    lines.append("--- Encoding check (names containing characters that suggest a decoding problem) ---")
+    checks = [
+        ("PX female (prenom)", px_female, "prenom"),
+        ("PX male (prenom)", px_male, "prenom"),
+        ("Population female (firstname)", population_frames["all_female_current"], "firstname"),
+        ("Population male (firstname)", population_frames["all_male_current"], "firstname"),
+    ]
+    for label, df, col in checks:
+        suspicious = check_name_encoding(df, col)
+        if len(suspicious):
+            lines.append(f"  {label}: {len(suspicious)} suspicious name(s) - {list(suspicious)}")
+        else:
+            lines.append(f"  {label}: OK, nothing suspicious")
+
+    lines.append("")
+    lines.append("--- PX Web vs. population census: does the census corroborate PX Web's latest year? ---")
+    for gender in ("female", "male"):
+        current = population_frames[f"all_{gender}_current"]
+        years_present = set(current["yearofbirth"].unique())
+        if DATA_YEAR in years_present:
+            n = int((current["yearofbirth"] == DATA_YEAR).sum())
+            lines.append(f"  {gender}: OK - population census has {n} name row(s) for yearofbirth={DATA_YEAR}.")
+        else:
+            latest_available = max(years_present) if years_present else "none"
+            lines.append(
+                f"  WARNING: {gender} population census has NO rows for yearofbirth={DATA_YEAR} "
+                f"(PX Web's most recent year). Latest birth year found in the census: {latest_available}. "
+                f"The census may not have caught up with this year's births yet - 'most common name' and "
+                f"name-length figures that rely on {DATA_YEAR} births may be incomplete."
+            )
+
+    lines.append("")
+    lines.append("--- Manual review reminder (not automatically verified) ---")
+    lines.append(
+        "  The 'Diversité des prénoms' / 'Vielfalt der Vornamen' paragraph (individualisation "
+        "trend since 1980) and the 'nos cartes' / 'unsere Karten' sentence (regional map) are "
+        "static text in build_article_sections() - PX Web only goes back to 2000, so neither is "
+        "re-verified against data each run. Skim them before publishing."
+    )
+
+    return lines
+
+
+def write_data_quality_log(lines: list) -> None:
+    print("\n" + "\n".join(lines) + "\n")
+    log_path = OUTPUT_DIR / f"data_quality_log_{DATA_YEAR}.txt"
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  (data quality log saved to {log_path.name})\n")
 
 
 # =============================================================================
@@ -289,23 +454,15 @@ def load_population_data():
 # =============================================================================
 
 def build_rankings(px_female: pd.DataFrame, px_male: pd.DataFrame) -> pd.DataFrame:
-    """Wide (one column per year) -> long, with a tie-free custom rank per
+    """px_female/px_male already arrive long (prenom, region_linguistique_canton,
+    year, value, gender) and pre-filtered to the "Nombre" unit by the PX Web
+    API query - just combine and add a tie-free custom rank per
     region/year/gender (ties broken alphabetically, like the original script)."""
-
-    def to_long(df, gender):
-        year_cols = [c for c in df.columns if re.fullmatch(r"\d{4}", c)]
-        long_df = df.melt(
-            id_vars=["prenom", "region_linguistique_canton", "unite_de_mesure"],
-            value_vars=year_cols,
-            var_name="year",
-            value_name="value",
-        )
-        long_df["year"] = long_df["year"].astype(int)
-        long_df["gender"] = gender
-        return long_df.dropna(subset=["value"])
-
-    combined = pd.concat([to_long(px_female, "female"), to_long(px_male, "male")], ignore_index=True)
-    combined = combined[combined["unite_de_mesure"] == "Nombre"].copy()
+    combined = pd.concat([px_female, px_male], ignore_index=True)
+    # BFS explicitly publishes "0" (not just a blank cell) for a name/year
+    # with no births at all - those aren't a real rank and must be dropped,
+    # or they'd all tie for last place and pollute rank-change computations.
+    combined = combined[combined["value"] > 0].copy()
 
     combined = combined.sort_values(
         by=["region_linguistique_canton", "year", "gender", "value", "prenom"],
@@ -330,15 +487,36 @@ def top_n(rankings: pd.DataFrame, region: str, gender: str, year: int, n: int) -
     )
 
 
+def national_evolution_table(rankings: pd.DataFrame, gender: str) -> pd.DataFrame:
+    """Rank, year by year, of today's top EVOLUTION_N_NAMES national names,
+    over the last EVOLUTION_N_YEARS years. Rows ordered by current rank,
+    columns are years; a name with no row in a given year (e.g. too rare to
+    be published that year) shows as NaN, rendered as "-" by the caller."""
+    current_top = top_n(rankings, NATIONAL_REGION, gender, DATA_YEAR, EVOLUTION_N_NAMES)["prenom"].tolist()
+    years = list(range(DATA_YEAR - EVOLUTION_N_YEARS + 1, DATA_YEAR + 1))
+
+    subset = rankings[
+        (rankings["region_linguistique_canton"] == NATIONAL_REGION)
+        & (rankings["gender"] == gender)
+        & (rankings["year"].isin(years))
+        & (rankings["prenom"].isin(current_top))
+    ][["prenom", "year", "custom_rank"]]
+
+    pivot = subset.pivot(index="prenom", columns="year", values="custom_rank")
+    return pivot.reindex(index=current_top, columns=years)
+
+
 # =============================================================================
 # YEAR-OVER-YEAR RANK CHANGES (climbers / fallers / new entries / exits)
 # =============================================================================
 
 def build_rank_changes(rankings: pd.DataFrame) -> pd.DataFrame:
+    """No cap here - every ranked name gets a row, however deep. Different
+    consumers apply their own threshold: new_entries_and_exits() uses
+    TOP_N_DISPLAY, climbers_and_fallers() uses CLIMBER_RANK_CEILING."""
     prev = rankings[
         (rankings["region_linguistique_canton"] == NATIONAL_REGION)
         & (rankings["year"] == COMPARISON_YEAR)
-        & (rankings["custom_rank"] <= TOP_N_ANALYSIS)
     ][["prenom", "gender", "value", "custom_rank"]].rename(
         columns={"value": "count_prev", "custom_rank": "rank_prev"}
     )
@@ -346,14 +524,18 @@ def build_rank_changes(rankings: pd.DataFrame) -> pd.DataFrame:
     curr = rankings[
         (rankings["region_linguistique_canton"] == NATIONAL_REGION)
         & (rankings["year"] == DATA_YEAR)
-        & (rankings["custom_rank"] <= TOP_N_ANALYSIS)
     ][["prenom", "gender", "value", "custom_rank"]].rename(
         columns={"value": "count_current", "custom_rank": "rank_current"}
     )
 
     changes = prev.merge(curr, on=["prenom", "gender"], how="outer")
-    changes["rank_prev"] = changes["rank_prev"].fillna(TOP_N_ANALYSIS + 1).astype(int)
-    changes["rank_current"] = changes["rank_current"].fillna(TOP_N_ANALYSIS + 1).astype(int)
+    # Sentinel for a name entirely absent from one side (never given before, or
+    # given zero times this year) - one rank worse than the least popular name
+    # actually tracked that year.
+    rank_prev_sentinel = int(prev["rank_prev"].max()) + 1
+    rank_current_sentinel = int(curr["rank_current"].max()) + 1
+    changes["rank_prev"] = changes["rank_prev"].fillna(rank_prev_sentinel).astype(int)
+    changes["rank_current"] = changes["rank_current"].fillna(rank_current_sentinel).astype(int)
     changes["rank_change"] = changes["rank_prev"] - changes["rank_current"]  # positive = climbed
     changes["count_change"] = changes["count_current"] - changes["count_prev"]
 
@@ -364,9 +546,18 @@ def build_rank_changes(rankings: pd.DataFrame) -> pd.DataFrame:
     return changes
 
 
-def climbers_and_fallers(changes: pd.DataFrame, n: int = 10):
-    """Top n climbers/fallers PER GENDER (not n total split however it falls)."""
-    continued = changes[changes["status"] == "Continued"]
+def climbers_and_fallers(changes: pd.DataFrame, n: int = 10, max_rank: int = CLIMBER_RANK_CEILING):
+    """Top n climbers/fallers PER GENDER (not n total split however it falls).
+    Restricted to names ranked within the top `max_rank` in BOTH years:
+    build_rank_changes() itself has no cap (a name can validly be ranked
+    900th), but for "biggest movers" specifically, a swing entirely outside
+    the top {max_rank} isn't a meaningful headline claim - it's usually just
+    small-sample noise from names given only a handful of times."""
+    continued = changes[
+        (changes["status"] == "Continued")
+        & (changes["rank_prev"] <= max_rank)
+        & (changes["rank_current"] <= max_rank)
+    ]
     cols = ["prenom", "gender", "rank_prev", "rank_current", "rank_change", "count_prev", "count_current", "count_change"]
 
     climbers = (
@@ -385,9 +576,13 @@ def climbers_and_fallers(changes: pd.DataFrame, n: int = 10):
 
 
 def new_entries_and_exits(changes: pd.DataFrame):
+    # new_entries keeps rank_prev/count_prev too (not just the current rank) so
+    # the article can show where each name came from, not just where it landed.
     new_entries = changes[
         (changes["rank_current"] <= TOP_N_DISPLAY) & (changes["rank_prev"] > TOP_N_DISPLAY)
-    ].sort_values("rank_current")[["prenom", "gender", "rank_current", "count_current"]]
+    ].sort_values("rank_current")[
+        ["prenom", "gender", "rank_prev", "rank_current", "count_prev", "count_current"]
+    ]
 
     exits = changes[
         (changes["rank_prev"] <= TOP_N_DISPLAY) & (changes["rank_current"] > TOP_N_DISPLAY)
@@ -457,7 +652,7 @@ def name_length_summary(all_names_current: pd.DataFrame) -> dict:
     if births.empty:
         raise ValueError(
             f"No population rows with yearofbirth == {DATA_YEAR}. The population "
-            f"snapshot may not cover births from {DATA_YEAR} yet."
+            f"snapshot may not cover births from {DATA_YEAR} yet (see the data quality log)."
         )
     births["name_length"] = births["firstname"].str.len()
 
@@ -476,228 +671,661 @@ def name_length_summary(all_names_current: pd.DataFrame) -> dict:
             "male": round(unweighted_by_gender.get("male", float("nan")), 2),
         },
     }
+    # Note: the unweighted "overall" figure sits between the unweighted male and
+    # female figures (it's a pooled mean of all distinct names, both genders) -
+    # it should never be compared directly against the WEIGHTED male/female
+    # figures, which use a different method and are usually noticeably lower.
 
 
 # =============================================================================
 # TEXT GENERATION
 # =============================================================================
 
-def fmt_ch(n) -> str:
-    """Swiss-style thousands separator: 12'345."""
+def fmt_fr(n) -> str:
+    """French-Swiss thousands separator: a plain space - 12 345."""
+    return f"{int(round(n)):,}".replace(",", " ")
+
+
+def fmt_de(n) -> str:
+    """German-Swiss thousands separator: an apostrophe - 12'345."""
     return f"{int(round(n)):,}".replace(",", "'")
 
 
-def fmt_en(n) -> str:
-    return f"{int(round(n)):,}"
+def fmt_by_lang(n, lang: str) -> str:
+    return fmt_de(n) if lang == "de" else fmt_fr(n)
 
 
-# --- concise "top movers" tables embedded right in the article text ---------
+def round_nearest(n, base: int = 500) -> int:
+    """Journalistic rounding for "près de X" style figures (e.g. 73'412 -> 73'500)."""
+    return int(base * round(n / base))
 
-GENDER_LABELS = {
-    "fr": {"male": "Garçon", "female": "Fille"},
-    "de": {"male": "Junge", "female": "Mädchen"},
-    "en": {"male": "Boy", "female": "Girl"},
+
+def decimal_comma(x: float, decimals: int) -> str:
+    """FR/DE both use a comma as the decimal separator: 5.6 -> "5,6"."""
+    return f"{x:.{decimals}f}".replace(".", ",")
+
+
+def ordinal_fr(n: int) -> str:
+    """Every call site here is "la {ordinal} place" (a feminine noun), so 1
+    needs the feminine "1ère", not the default masculine "1er"."""
+    return "1ère" if n == 1 else f"{n}e"
+
+
+def format_year_groups(years: list) -> list:
+    """Sorted years -> list of consecutive-run lists, e.g. [2011,2012,2014] -> [[2011,2012],[2014]]."""
+    if not years:
+        return []
+    runs, run = [], [years[0]]
+    for y in years[1:]:
+        if y == run[-1] + 1:
+            run.append(y)
+        else:
+            runs.append(run)
+            run = [y]
+    runs.append(run)
+    return runs
+
+
+def format_years_fr(years: list) -> str:
+    """1997, 1998, 1999 -> "de 1997 à 1999"; a run of exactly 2 -> "1997 et 1998";
+    a lone year -> "1997". Groups are then joined with commas, and the final
+    connector is "puis" if the last group is a range, "et" otherwise - this
+    exactly reproduces how BFS-derived articles phrase these lists."""
+    tokens, last_is_range = [], False
+    for run in format_year_groups(years):
+        if len(run) >= 3:
+            tokens.append(f"de {run[0]} à {run[-1]}")
+            last_is_range = True
+        elif len(run) == 2:
+            tokens.append(f"{run[0]} et {run[1]}")
+            last_is_range = False
+        else:
+            tokens.append(str(run[0]))
+            last_is_range = False
+    if len(tokens) == 1:
+        return tokens[0]
+    connector = "puis" if last_is_range else "et"
+    return ", ".join(tokens[:-1]) + f", {connector} " + tokens[-1]
+
+
+def format_years_de(years: list) -> str:
+    """Same idea as format_years_fr, but German style: runs (of any length >=2)
+    are simply comma-joined (no "und" internally), only 3+ runs become a
+    "von X bis Y" range, and the final connector is "sowie" for a trailing
+    range, "und" otherwise."""
+    tokens, last_is_range = [], False
+    for run in format_year_groups(years):
+        if len(run) >= 3:
+            tokens.append(f"von {run[0]} bis {run[-1]}")
+            last_is_range = True
+        else:
+            tokens.append(", ".join(str(y) for y in run))
+            last_is_range = False
+    if len(tokens) == 1:
+        return tokens[0]
+    connector = "sowie" if last_is_range else "und"
+    return ", ".join(tokens[:-1]) + f" {connector} " + tokens[-1]
+
+
+def gap_text_fr(n: int) -> str:
+    return "une année" if n == 1 else f"{n} années"
+
+
+def gap_text_de(n: int) -> str:
+    return "einem Jahr" if n == 1 else f"{n} Jahren"
+
+
+def round_down_to_ten(n: int) -> int:
+    """For the "reculent de plus de X rangs" / "verloren über X Plätze"
+    understatement: round a loss down to the nearest ten so the claim is
+    always conservatively true."""
+    return (n // 10) * 10
+
+
+GERMAN_TENS = {
+    10: "zehn", 20: "zwanzig", 30: "dreissig", 40: "vierzig", 50: "fünfzig",
+    60: "sechzig", 70: "siebzig", 80: "achtzig", 90: "neunzig",
 }
-MOVERS_TABLE_HEADERS = {
-    "fr": ["Prénom", "Sexe", "Rang {prev}", "Rang {curr}", "Évolution"],
-    "de": ["Name", "Geschlecht", "Rang {prev}", "Rang {curr}", "Veränderung"],
-    "en": ["Name", "Gender", "Rank {prev}", "Rank {curr}", "Change"],
+
+
+def number_word_de(n: int) -> str:
+    """Spells out round tens under 100 for German prose (e.g. "über sechzig
+    Plätze"), matching how this is actually written in practice. Compound
+    hundred-words like "siebenhundertvierzig" read as unusual/stilted in a
+    news sentence, so anything >= 100 is left as a plain digit instead."""
+    return GERMAN_TENS.get(n, str(n))
+
+
+# --- shared table-building helpers -------------------------------------------
+
+GENDER_LABELS_PLURAL = {
+    "fr": {"male": "Garçons", "female": "Filles"},
+    "de": {"male": "Jungen", "female": "Mädchen"},
 }
+NAME_HEADER = {"fr": "Prénom", "de": "Name"}
+
 _TH_STYLE = "text-align:left;border-bottom:2px solid #ccc;padding:4px 8px;"
 _TD_STYLE = "padding:4px 8px;border-bottom:1px solid #eee;"
+_TOP3_HIGHLIGHT_STYLE = "background:#fed7aa;font-weight:700;"
 
 
-def movers_table_html(df: pd.DataFrame, lang: str, comparison_year: int, data_year: int) -> str:
-    headers = [h.format(prev=comparison_year, curr=data_year) for h in MOVERS_TABLE_HEADERS[lang]]
-    head_html = "".join(f"<th style='{_TH_STYLE}'>{h}</th>" for h in headers)
-
-    rows_html = []
-    for _, row in df.iterrows():
-        change = int(row["rank_change"])
-        change_str = f"+{change}" if change > 0 else str(change)
-        cells = [
-            row["prenom"],
-            GENDER_LABELS[lang][row["gender"]],
-            int(row["rank_prev"]),
-            int(row["rank_current"]),
-            change_str,
-        ]
-        rows_html.append("<tr>" + "".join(f"<td style='{_TD_STYLE}'>{c}</td>" for c in cells) + "</tr>")
-
+def _table(headers_html: str, rows_html: str, font_size: str = ".92rem") -> str:
     return (
-        "<table style='border-collapse:collapse;width:100%;margin:.5rem 0 1.25rem;font-size:.92rem;'>"
-        f"<thead><tr>{head_html}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
+        f"<table style='border-collapse:collapse;width:100%;margin:.5rem 0 1.25rem;font-size:{font_size};'>"
+        f"<thead><tr>{headers_html}</tr></thead><tbody>{rows_html}</tbody></table>"
     )
 
 
-def build_article_texts(ctx: dict, climbers_top: pd.DataFrame, fallers_top: pd.DataFrame) -> dict:
+def _th(headers) -> str:
+    return "".join(f"<th style='{_TH_STYLE}'>{h}</th>" for h in headers)
+
+
+def _td_row(cells, first_cell_bold: bool = False) -> str:
+    tds = []
+    for i, c in enumerate(cells):
+        style = _TD_STYLE + ("font-weight:600;" if i == 0 and first_cell_bold else "")
+        tds.append(f"<td style='{style}'>{c}</td>")
+    return "<tr>" + "".join(tds) + "</tr>"
+
+
+# --- 1. national top-10 evolution table --------------------------------------
+
+def evolution_table_html(pivot: pd.DataFrame, lang: str) -> str:
+    head_html = _th([NAME_HEADER[lang]] + list(pivot.columns))
+    rows = []
+    for prenom, row in pivot.iterrows():
+        cells = [f"<td style='{_TD_STYLE}font-weight:600;'>{prenom}</td>"]
+        for year in pivot.columns:
+            value = row[year]
+            if pd.isna(value):
+                cells.append(f"<td style='{_TD_STYLE}'>-</td>")
+            else:
+                rank = int(value)
+                style = _TD_STYLE + (_TOP3_HIGHLIGHT_STYLE if rank <= 3 else "")
+                cells.append(f"<td style='{style}'>{rank}</td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    return _table(head_html, "".join(rows), font_size=".85rem")
+
+
+# --- 2. climbers / fallers (single gender, with counts, top 3 highlighted) ----
+
+MOVERS_TABLE_HEADERS = {
+    "fr": ["Prénom", "Rang {prev}", "Rang {curr}", "Effectif {prev}", "Effectif {curr}", "Évolution"],
+    "de": ["Name", "Rang {prev}", "Rang {curr}", "Anzahl {prev}", "Anzahl {curr}", "Veränderung"],
+}
+
+
+def movers_table_html(df: pd.DataFrame, lang: str, comparison_year: int, data_year: int) -> str:
+    """The first 3 rows are assumed to be the biggest movers (df must already
+    be sorted that way) - their "Évolution" cell is highlighted."""
+    headers = [h.format(prev=comparison_year, curr=data_year) for h in MOVERS_TABLE_HEADERS[lang]]
+    rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        change = int(row["rank_change"])
+        change_str = f"+{change}" if change > 0 else str(change)
+        cells = [
+            row["prenom"], int(row["rank_prev"]), int(row["rank_current"]),
+            int(row["count_prev"]), int(row["count_current"]), change_str,
+        ]
+        tds = []
+        for j, c in enumerate(cells):
+            style = _TD_STYLE
+            if j == 0:
+                style += "font-weight:600;"
+            if j == len(cells) - 1 and i < 3:
+                style += _TOP3_HIGHLIGHT_STYLE
+            tds.append(f"<td style='{style}'>{c}</td>")
+        rows.append("<tr>" + "".join(tds) + "</tr>")
+    return _table(_th(headers), "".join(rows))
+
+
+# --- 3. new entries into the national top 100 (single gender) -----------------
+# Shows both where a name landed AND where it came from (rank_prev/count_prev),
+# matching the same variables as the movers tables above.
+
+NEW_ENTRIES_TABLE_HEADERS = {
+    "fr": ["Prénom", "Rang {prev}", "Rang {curr}", "Effectif {prev}", "Effectif {curr}"],
+    "de": ["Name", "Rang {prev}", "Rang {curr}", "Anzahl {prev}", "Anzahl {curr}"],
+}
+
+
+def new_entries_table_html(df: pd.DataFrame, lang: str, comparison_year: int, data_year: int) -> str:
+    headers = [h.format(prev=comparison_year, curr=data_year) for h in NEW_ENTRIES_TABLE_HEADERS[lang]]
+    rows = []
+    for _, row in df.iterrows():
+        # count_prev (and thus rank_prev) is NaN/sentinel only for a name that
+        # was never given at all the year before - as opposed to a real, if
+        # modest, rank below the top 100.
+        if pd.isna(row["count_prev"]):
+            rank_prev_display, count_prev_display = "-", "-"
+        else:
+            rank_prev_display, count_prev_display = str(int(row["rank_prev"])), int(row["count_prev"])
+        cells = [row["prenom"], rank_prev_display, int(row["rank_current"]), count_prev_display, int(row["count_current"])]
+        rows.append(_td_row(cells, first_cell_bold=True))
+    return _table(_th(headers), "".join(rows))
+
+
+# --- 4. regional top 3 (one table, all 3 regions, colour-coded rows) ----------
+
+REGIONAL_TABLE_HEADERS = {
+    "fr": ["Région", "Rang", "Garçon", "Fille"],
+    "de": ["Region", "Rang", "Junge", "Mädchen"],
+}
+REGION_DISPLAY_NAMES = {
+    "fr": {"alemanique": "Suisse alémanique", "romande": "Suisse romande", "italienne": "Suisse italienne"},
+    "de": {"alemanique": "Deutschschweiz", "romande": "Romandie", "italienne": "Italienische Schweiz"},
+}
+REGION_ROW_COLORS = {
+    "alemanique": "#dbeafe",  # light blue
+    "romande": "#fef3c7",     # light amber
+    "italienne": "#dcfce7",   # light green
+}
+
+
+def regional_table_html(rankings_regional: pd.DataFrame, lang: str) -> str:
+    rows = []
+    for key, region_label in LINGUISTIC_REGIONS.items():
+        region_display = REGION_DISPLAY_NAMES[lang][key]
+        bg = REGION_ROW_COLORS[key]
+        sub = rankings_regional[rankings_regional["region"] == region_label]
+        for rank in (1, 2, 3):
+            male_row = sub[(sub["gender"] == "male") & (sub["custom_rank"] == rank)]
+            female_row = sub[(sub["gender"] == "female") & (sub["custom_rank"] == rank)]
+            male_name = male_row["prenom"].iloc[0] if len(male_row) else "-"
+            female_name = female_row["prenom"].iloc[0] if len(female_row) else "-"
+            cells = [region_display if rank == 1 else "", rank, male_name, female_name]
+            tds = "".join(f"<td style='{_TD_STYLE}background:{bg};'>{c}</td>" for c in cells)
+            rows.append(f"<tr>{tds}</tr>")
+    return _table(_th(REGIONAL_TABLE_HEADERS[lang]), "".join(rows))
+
+
+# --- 5. most common names overall (population), top 3 per gender, with change -
+
+MOST_COMMON_TABLE_HEADERS = {
+    "fr": ["Sexe", "Rang", "Prénom", "Effectif {curr}", "Effectif {prev}", "Évolution"],
+    "de": ["Geschlecht", "Rang", "Name", "Anzahl {curr}", "Anzahl {prev}", "Veränderung"],
+}
+
+
+def most_common_table_html(male_top3: pd.DataFrame, female_top3: pd.DataFrame, lang: str,
+                            comparison_year: int, data_year: int) -> str:
+    headers = [h.format(prev=comparison_year, curr=data_year) for h in MOST_COMMON_TABLE_HEADERS[lang]]
+    rows = []
+    for gender, df in [("male", male_top3), ("female", female_top3)]:
+        gender_label = GENDER_LABELS_PLURAL[lang][gender]
+        for i, row in enumerate(df.itertuples(index=False), start=1):
+            change = row.total_population_current - row.total_population_previous
+            change_str = f"+{fmt_by_lang(change, lang)}" if change > 0 else (
+                f"-{fmt_by_lang(abs(change), lang)}" if change < 0 else "0"
+            )
+            cells = [
+                gender_label if i == 1 else "", i, row.firstname,
+                fmt_by_lang(row.total_population_current, lang),
+                fmt_by_lang(row.total_population_previous, lang),
+                change_str,
+            ]
+            rows.append(_td_row(cells))
+    return _table(_th(headers), "".join(rows))
+
+
+# --- article assembly ---------------------------------------------------------
+# Article text is kept as PLAIN TEXT (no HTML tags) since the target CMS takes
+# plain text, not HTML - each section gets its own heading, a highly visible
+# "code block" with the plain-text copy, then its supporting tables (with
+# explicit, self-explanatory titles) right below.
+
+TABLE_TITLES = {
+    "fr": {
+        "evolution": "Évolution du rang national, {gender} ({y0}–{y1})",
+        "climbers": "Plus fortes progressions de rang, {gender} ({prev}→{curr})",
+        "fallers": "Plus forts reculs de rang, {gender} ({prev}→{curr})",
+        "new_entries": "Nouvelles entrées dans le top 100, {gender} ({prev}→{curr})",
+        "regional": "Top 3 par région linguistique ({curr})",
+        "most_common": "Prénoms les plus portés dans la population totale, par sexe ({curr} vs {prev})",
+    },
+    "de": {
+        "evolution": "Entwicklung des nationalen Rangs, {gender} ({y0}–{y1})",
+        "climbers": "Stärkste Rangaufstiege, {gender} ({prev}→{curr})",
+        "fallers": "Stärkste Rangabstiege, {gender} ({prev}→{curr})",
+        "new_entries": "Neueinsteiger in die Top 100, {gender} ({prev}→{curr})",
+        "regional": "Top 3 nach Sprachregion ({curr})",
+        "most_common": "Häufigste Vornamen der Gesamtbevölkerung, nach Geschlecht ({curr} vs. {prev})",
+    },
+}
+
+
+# --- "years as national #1" narrative (leader continuity / return / first time) ----
+
+def leader_history(rankings: pd.DataFrame, gender: str, name: str, year: int) -> dict:
+    """All years strictly before `year` where `name` (gender) held national
+    rank 1. Returns the status needed to phrase the leader paragraph:
+    - "first_time": never been #1 before.
+    - "continuing": was also #1 the immediately preceding year.
+    - "returning": was #1 before, but not last year (includes the gap length)."""
+    prior_years = sorted(rankings[
+        (rankings["region_linguistique_canton"] == NATIONAL_REGION)
+        & (rankings["gender"] == gender)
+        & (rankings["prenom"] == name)
+        & (rankings["custom_rank"] == 1)
+        & (rankings["year"] < year)
+    ]["year"].tolist())
+
+    if not prior_years:
+        return {"status": "first_time", "years": []}
+    if prior_years[-1] == year - 1:
+        return {"status": "continuing", "years": prior_years}
+    return {"status": "returning", "years": prior_years, "gap": (year - 1) - prior_years[-1]}
+
+
+def leader_paragraph_fr(name: str, history: dict, second: str, third: str, year: int,
+                         podium_unchanged: bool, lead_sentence: str = None) -> str:
+    default_lead = f"{name} prend la tête du classement, devant {second} et {third}."
+    if history["status"] == "first_time":
+        return lead_sentence or f"{name} prend la tête du classement pour la première fois, devant {second} et {third}."
+    years_text = format_years_fr(history["years"])
+    if history["status"] == "continuing":
+        clause = f"Déjà en tête en {years_text}, {name} conserve sa première place en {year}."
+        podium = (
+            f"Comme l'année précédente, {second} et {third} complètent le podium."
+            if podium_unchanged else f"{second} et {third} complètent le podium."
+        )
+        return f"{clause} {podium}"
+    gap = gap_text_fr(history["gap"])
+    lead = lead_sentence or default_lead
+    return (
+        f"{lead} Après {gap} d'interruption, le prénom retrouve ainsi la première place, "
+        f"qu'il avait déjà occupée en {years_text}."
+    )
+
+
+def leader_paragraph_de(name: str, gender: str, history: dict, second: str, third: str, year: int,
+                         podium_unchanged: bool, lead_sentence: str = None) -> str:
+    pronoun = "Sie" if gender == "female" else "Er"
+    rel_pronoun = "die" if gender == "female" else "der"
+    default_lead = f"{name} ist neu an erster Stelle, gefolgt von {second} und {third}."
+    if history["status"] == "first_time":
+        return lead_sentence or f"{name} steht zum ersten Mal an erster Stelle, gefolgt von {second} und {third}."
+    years_text = format_years_de(history["years"])
+    if history["status"] == "continuing":
+        clause = f"{name}, {rel_pronoun} bereits {years_text} am beliebtesten war, behielt auch {year} wieder die Spitzenposition."
+        podium = (
+            f"Dahinter folgen wie bereits letztes Jahr {second} und {third}."
+            if podium_unchanged else f"Dahinter folgen {second} und {third}."
+        )
+        return f"{clause} {podium}"
+    gap = gap_text_de(history["gap"])
+    lead = lead_sentence or default_lead
+    return (
+        f"{lead} {name} nimmt damit nach {gap} Unterbruch wieder den ersten Platz ein. "
+        f"{pronoun} war bereits {years_text} der beliebteste Vorname."
+    )
+
+
+def build_article_sections(ctx: dict, t: dict) -> dict:
+    """Returns {lang: [section, ...]}, each section:
+    {"label": str | None, "text": plain-text str (paragraphs separated by a
+    blank line), "tables": [(title, html), ...]}.
+    Consumed by build_article_page_html (one language) and build_report_html
+    (all languages on one page). English is intentionally not generated -
+    only FR/DE are produced, per editorial decision."""
     year, prev_year = ctx["data_year"], ctx["comparison_year"]
+    y0 = year - EVOLUTION_N_YEARS + 1
 
-    fr = f"""
-<p><strong>Quels étaient les prénoms les plus populaires en {year} ? Et comment les tendances ont-elles évolué au fil des décennies ? Découvrez-le grâce à notre outil interactif.</strong></p>
+    def title(lang, key, gender=None):
+        kwargs = {"prev": prev_year, "curr": year, "y0": y0, "y1": year}
+        if gender:
+            kwargs["gender"] = GENDER_LABELS_PLURAL[lang][gender]
+        return TABLE_TITLES[lang][key].format(**kwargs)
 
-<h2>Les prénoms vedettes de {year}</h2>
+    sections = {}
 
-<p>Voici les stars de {year} : <strong>{ctx['national_female_1']}</strong> et <strong>{ctx['national_male_1']}</strong> sont les prénoms qui ont été donnés le plus souvent aux nouveau-nés en Suisse l'an passé.</p>
+    # =====================================================================
+    # FRENCH
+    # =====================================================================
+    sections["fr"] = [
+        {
+            "label": "Titre",
+            "text": "Voici les prénoms les plus populaires en Suisse – où se situe le vôtre dans le classement ?",
+            "tables": [],
+        },
+        {
+            "label": "Chapô",
+            "text": (
+                f"Quels ont été les prénoms les plus populaires en {year} ? Et comment la popularité du "
+                f"vôtre a-t-elle évolué au fil des ans ? Découvrez-le grâce à notre outil interactif."
+            ),
+            "tables": [],
+        },
+        {
+            "label": f"Les prénoms vedettes de {year}",
+            "text": (
+                f"{ctx['national_female_1']} et {ctx['national_male_1']} ont été les prénoms les plus donnés aux nouveau-nés en Suisse en {year}, selon la statistique annuelle publiée par l'Office fédéral de la statistique (OFS). L'an dernier, {ctx['national_male_1_count']} bébés ont été prénommés {ctx['national_male_1']} et {ctx['national_female_1_count']} {ctx['national_female_1']}.\n\n"
+                f"{ctx['male_leader_text_fr']}\n\n"
+                f"{ctx['female_leader_text_fr']}"
+            ),
+            "tables": [
+                (title("fr", "evolution", "male"), evolution_table_html(t["evolution_male"], "fr")),
+                (title("fr", "evolution", "female"), evolution_table_html(t["evolution_female"], "fr")),
+            ],
+        },
+        {
+            "label": "Qui progresse, qui recule ?",
+            "text": (
+                f"{ctx['female_climber']}, chez les filles, et {ctx['male_climber']}, chez les garçons, enregistrent de belles progressions : la première passe de la {ordinal_fr(ctx['female_climber_rank_prev'])} à la {ordinal_fr(ctx['female_climber_rank_curr'])} place, le second de la {ordinal_fr(ctx['male_climber_rank_prev'])} à la {ordinal_fr(ctx['male_climber_rank_curr'])}.\n\n"
+                f"À l'inverse, {ctx['female_faller']} et {ctx['male_faller']} accusent un net recul. {ctx['female_faller']} passe de la {ordinal_fr(ctx['female_faller_rank_prev'])} à la {ordinal_fr(ctx['female_faller_rank_curr'])} place et {ctx['male_faller']} de la {ordinal_fr(ctx['male_faller_rank_prev'])} à la {ordinal_fr(ctx['male_faller_rank_curr'])}. Tous deux reculent ainsi de plus de {ctx['fallers_min_loss_rounded']} rangs."
+            ),
+            "tables": [
+                (title("fr", "climbers", "male"), movers_table_html(t["climbers_male"], "fr", prev_year, year)),
+                (title("fr", "climbers", "female"), movers_table_html(t["climbers_female"], "fr", prev_year, year)),
+                (title("fr", "fallers", "male"), movers_table_html(t["fallers_male"], "fr", prev_year, year)),
+                (title("fr", "fallers", "female"), movers_table_html(t["fallers_female"], "fr", prev_year, year)),
+            ],
+        },
+        {
+            "label": "Les petits nouveaux",
+            "text": (
+                f"{ctx['female_new_entry']} (rang {ctx['female_new_entry_rank']}) et {ctx['male_new_entry']} (rang {ctx['male_new_entry_rank']}) font leur entrée dans le top 100 des prénoms les plus donnés aux nouveau-nés."
+            ),
+            "tables": [
+                (title("fr", "new_entries", "male"), new_entries_table_html(t["new_entries_male"], "fr", prev_year, year)),
+                (title("fr", "new_entries", "female"), new_entries_table_html(t["new_entries_female"], "fr", prev_year, year)),
+            ],
+        },
+        {
+            "label": "Des préférences régionales",
+            "text": (
+                f"Les préférences varient aussi selon les régions linguistiques. En Suisse alémanique, {ctx['alemanique_male_1']} et {ctx['alemanique_female_1']} arrivent en tête, tandis qu'en Suisse romande, {ctx['romande_female_1']} et {ctx['romande_male_1']} dominent le classement. En Suisse italienne, {ctx['italienne_male_1']} et {ctx['italienne_female_1']} occupent la première marche du podium.\n\n"
+                f"Les goûts diffèrent également d'un canton à l'autre, comme le montrent nos cartes."
+            ),
+            "tables": [(title("fr", "regional"), regional_table_html(t["regional"], "fr"))],
+        },
+        {
+            "label": "Les prénoms les plus portés en Suisse",
+            "text": (
+                f"La statistique des prénoms de l'OFS permet aussi de mesurer leur fréquence relative pour chaque année de naissance. Il est ainsi possible de comparer de manière pertinente l'évolution de la popularité de différents prénoms au fil des décennies.\n\n"
+                f"Même si {ctx['most_common_female_1']} est en net recul parmi les jeunes générations, il reste le prénom féminin le plus répandu dans l'ensemble de la population suisse, avec près de {fmt_fr(ctx['most_common_female_1_rounded'])} personnes qui le portent. Suivent {ctx['most_common_female_2']}, avec près de {fmt_fr(ctx['most_common_female_2_rounded'])} personnes, et {ctx['most_common_female_3']}, avec {fmt_fr(ctx['most_common_female_3_rounded'])}.\n\n"
+                f"Chez les hommes, {ctx['most_common_male_1']} reste le prénom le plus répandu en Suisse : près de {fmt_fr(ctx['most_common_male_1_rounded'])} hommes et garçons le portent. {ctx['most_common_male_2']} et {ctx['most_common_male_3']} arrivent ensuite."
+            ),
+            "tables": [(title("fr", "most_common"), most_common_table_html(t["most_common_male"], t["most_common_female"], "fr", prev_year, year))],
+        },
+        {
+            "label": "Diversité des prénoms",
+            "text": (
+                "Après une nette tendance à l'individualisation des prénoms entre 1980 et les années 1990, "
+                "les parents suisses se tournent à nouveau davantage vers les mêmes prénoms depuis la fin "
+                "des années 1990. La diversité tend ainsi à diminuer."
+            ),
+            "tables": [],
+        },
+        {
+            "label": "Des prénoms de plus en plus courts ?",
+            "text": (
+                f"Avec {ctx['national_female_1']} et {ctx['national_male_1']}, ce sont une nouvelle fois deux prénoms courts qui ont été les plus donnés en {year}. Les prénoms des enfants nés cette année-là comptent en moyenne {ctx['avg_length_overall_fmt']} lettres. Ils sont légèrement plus longs chez les filles, avec {ctx['avg_length_female_fmt']} lettres en moyenne, que chez les garçons, avec {ctx['avg_length_male_fmt']}.\n\n"
+                f"Les générations plus âgées ont, en moyenne, des prénoms plus longs."
+            ),
+            "tables": [],
+        },
+    ]
 
-<p><strong>{ctx['national_male_1']}</strong> garde la première place, comme lors d'années précédentes où il dominait les classements. Le top 3 est resté stable : <strong>{ctx['national_male_1']}</strong> est encore suivi par <strong>{ctx['national_male_2']}</strong> et par <strong>{ctx['national_male_3']}</strong> au niveau national.</p>
+    # =====================================================================
+    # GERMAN
+    # =====================================================================
+    sections["de"] = [
+        {
+            "label": "Titel",
+            "text": "Das sind die beliebtesten Vornamen – wo liegt Ihrer in der Rangliste?",
+            "tables": [],
+        },
+        {
+            "label": "Lead",
+            "text": (
+                f"Welches waren die beliebtesten Vornamen {year}, und wie hat sich die Beliebtheit Ihres "
+                f"eigenen Namens über die Jahre entwickelt? Finden Sie es mit unserem interaktiven Tool heraus."
+            ),
+            "tables": [],
+        },
+        {
+            "label": f"Die Namen des Jahres {year}",
+            "text": (
+                f"{ctx['national_female_1']} und {ctx['national_male_1']} waren {year} in der Schweiz die beliebtesten Vornamen für Neugeborene, wie das Bundesamt für Statistik (BFS) in seiner alljährlichen Namens-Statistik mitteilt. {ctx['national_male_1']} wurden im vergangenen Jahr {ctx['national_male_1_count']} Babys genannt, {ctx['national_female_1']} {ctx['national_female_1_count']}.\n\n"
+                f"{ctx['male_leader_text_de']}\n\n"
+                f"{ctx['female_leader_text_de']}"
+            ),
+            "tables": [
+                (title("de", "evolution", "male"), evolution_table_html(t["evolution_male"], "de")),
+                (title("de", "evolution", "female"), evolution_table_html(t["evolution_female"], "de")),
+            ],
+        },
+        {
+            "label": "Wer steigt, wer fällt?",
+            "text": (
+                f"Die Vornamen {ctx['female_climber']} (von Rang {ctx['female_climber_rank_prev']} auf {ctx['female_climber_rank_curr']}) bei den Mädchen und {ctx['male_climber']} (von Rang {ctx['male_climber_rank_prev']} auf {ctx['male_climber_rank_curr']}) bei den Knaben legten in der Rangliste spürbar zu.\n\n"
+                f"Deutlich verloren haben {ctx['female_faller']} (von Rang {ctx['female_faller_rank_prev']} auf {ctx['female_faller_rank_curr']}) bei den Mädchen und {ctx['male_faller']} (von Rang {ctx['male_faller_rank_prev']} auf {ctx['male_faller_rank_curr']}) bei den Knaben. Sie verloren beide über {ctx['fallers_min_loss_word_de']} Plätze."
+            ),
+            "tables": [
+                (title("de", "climbers", "male"), movers_table_html(t["climbers_male"], "de", prev_year, year)),
+                (title("de", "climbers", "female"), movers_table_html(t["climbers_female"], "de", prev_year, year)),
+                (title("de", "fallers", "male"), movers_table_html(t["fallers_male"], "de", prev_year, year)),
+                (title("de", "fallers", "female"), movers_table_html(t["fallers_female"], "de", prev_year, year)),
+            ],
+        },
+        {
+            "label": "Die Neuankömmlinge",
+            "text": (
+                f"Neu gehören {ctx['female_new_entry']} (Rang {ctx['female_new_entry_rank']}) und {ctx['male_new_entry']} (Rang {ctx['male_new_entry_rank']}) zu den 100 beliebtesten Vornamen von Neugeborenen."
+            ),
+            "tables": [
+                (title("de", "new_entries", "male"), new_entries_table_html(t["new_entries_male"], "de", prev_year, year)),
+                (title("de", "new_entries", "female"), new_entries_table_html(t["new_entries_female"], "de", prev_year, year)),
+            ],
+        },
+        {
+            "label": "Regionale Vorlieben",
+            "text": (
+                f"Die beliebtesten Vornamen {year} unterscheiden sich auch in den Sprachregionen: In der Deutschschweiz stehen {ctx['alemanique_male_1']} und {ctx['alemanique_female_1']} an erster Stelle, während in der Romandie {ctx['romande_female_1']} und {ctx['romande_male_1']} die Rangliste anführen. In der italienischsprachigen Schweiz stehen {ctx['italienne_male_1']} und {ctx['italienne_female_1']} zuoberst auf dem Treppchen.\n\n"
+                f"Auch zwischen den Kantonen gibt es unterschiedliche Vorlieben, wie unsere Karten zeigen."
+            ),
+            "tables": [(title("de", "regional"), regional_table_html(t["regional"], "de"))],
+        },
+        {
+            "label": "Die häufigsten Vornamen der Schweiz",
+            "text": (
+                f"In der Schweiz lässt sich die BFS-Vornamenstatistik auch in relativen Zahlen pro Jahrgang abfragen. So sind aussagekräftige Vergleiche verschiedener Vornamen punkto Beliebtheit über die Jahrzehnte möglich.\n\n"
+                f"Auch wenn sich der Name {ctx['most_common_female_1']} bei jüngeren Jahrgängen im Abschwung befindet, ist er mit fast {fmt_de(ctx['most_common_female_1_rounded'])} Namensträgerinnen immer noch jener weibliche Vorname, der in der Gesamtbevölkerung am häufigsten vorkommt. Dahinter kommen die knapp {fmt_de(ctx['most_common_female_2_rounded'])} {ctx['most_common_female_2']}s und {fmt_de(ctx['most_common_female_3_rounded'])} {ctx['most_common_female_3']}s.\n\n"
+                f"Bei den Männern ist {ctx['most_common_male_1']} immer noch der häufigste Vorname in der Schweiz. Fast {fmt_de(ctx['most_common_male_1_rounded'])} Männer und Knaben heissen so. Dahinter folgen {ctx['most_common_male_2']} und {ctx['most_common_male_3']}."
+            ),
+            "tables": [(title("de", "most_common"), most_common_table_html(t["most_common_male"], t["most_common_female"], "de", prev_year, year))],
+        },
+        {
+            "label": "Vielfalt der Vornamen",
+            "text": (
+                "Nachdem es von 1980 bis in die 1990er-Jahre einen klaren Trend zur Individualisierung der "
+                "Vornamen gegeben hat, wählen die Schweizer Eltern seit Ende der 1990er-Jahre wieder vermehrt "
+                "ähnliche Vornamen aus. Die Vielfalt wird kleiner."
+            ),
+            "tables": [],
+        },
+        {
+            "label": "Werden die Vornamen kürzer?",
+            "text": (
+                f"Mit {ctx['national_female_1']} und {ctx['national_male_1']} wurden im Jahr {year} erneut zwei kurze Namen am häufigsten vergeben. Die durchschnittliche Vornamenslänge der im Jahr {year} Geborenen liegt bei {ctx['avg_length_overall_fmt']} Zeichen. Bei Mädchen ist die Länge mit {ctx['avg_length_female_fmt']} Zeichen etwas umfangreicher als bei den Buben mit {ctx['avg_length_male_fmt']}.\n\n"
+                f"Ältere Personen haben tendenziell längere Vornamen."
+            ),
+            "tables": [],
+        },
+    ]
 
-<p>Chez les filles, <strong>{ctx['national_female_1']}</strong> reprend la première place, suivie par <strong>{ctx['national_female_2']}</strong> et par <strong>{ctx['national_female_3']}</strong>. Cela représente les tendances de préférences actuelles pour les prénoms féminins.</p>
-
-<h2>Qui progresse, qui recule ?</h2>
-
-<p>Quels sont les prénoms qui grimpent le plus ? Il y a <strong>{ctx['female_climber']}</strong> chez les filles et <strong>{ctx['male_climber']}</strong> chez les garçons. Ce sont les prénoms qui ont gagné le plus de places dans le classement. Ils ont progressé respectivement de {ctx['female_climber_gain']} et {ctx['male_climber_gain']} places entre {prev_year} et {year}.</p>
-
-{movers_table_html(climbers_top, "fr", prev_year, year)}
-
-<p>Parmi les prénoms qui ont dégringolé, il y a <strong>{ctx['female_faller']}</strong> chez les filles et <strong>{ctx['male_faller']}</strong> chez les garçons. Ils ont respectivement perdu plus de {ctx['female_faller_loss']} et {ctx['male_faller_loss']} places.</p>
-
-{movers_table_html(fallers_top, "fr", prev_year, year)}
-
-<h2>Les petits nouveaux</h2>
-
-<p>Parmi les nouveaux venus dans le top 100 des prénoms les plus populaires pour les nouveaux-nés, on trouve désormais {ctx['new_entries_text']}.</p>
-
-<h2>Des préférences différentes selon les régions</h2>
-
-<p>Les prénoms les plus populaires en {year} ne sont pas les mêmes partout : en Suisse alémanique, <strong>{ctx['alemanique_male_1']}</strong> et <strong>{ctx['alemanique_female_1']}</strong> occupent la première place, mais en Suisse romande, ce sont <strong>{ctx['romande_male_1']}</strong> et <strong>{ctx['romande_female_1']}</strong> qui sont en tête du classement. En Suisse italienne, ce sont <strong>{ctx['italienne_male_1']}</strong> et <strong>{ctx['italienne_female_1']}</strong> qui occupent la première place du podium.</p>
-
-<h2>Les prénoms les plus portés en Suisse</h2>
-
-<p>Même si le prénom <strong>{ctx['most_common_female']}</strong> est en perte de vitesse, il reste le prénom féminin le plus répandu dans l'ensemble de la population, avec près de {fmt_ch(ctx['most_common_female_count'])} femmes portant ce prénom, contre {fmt_ch(ctx['most_common_female_count_prev'])} l'année précédente.</p>
-
-<p>Chez les hommes, <strong>{ctx['most_common_male']}</strong> est toujours le prénom le plus fréquent en Suisse. Près de {fmt_ch(ctx['most_common_male_count'])} hommes et garçons s'appellent ainsi, contre {fmt_ch(ctx['most_common_male_count_prev'])} en {prev_year}.</p>
-
-<h2>Des prénoms de plus en plus courts ?</h2>
-
-<p>Avec <strong>{ctx['national_female_1']}</strong> et <strong>{ctx['national_male_1']}</strong>, ce sont à nouveau deux prénoms courts qui ont été attribués le plus souvent en {year}. La longueur moyenne des prénoms donnés en {year} est de {ctx['avg_length_weighted_overall']} caractères si l'on tient compte de la fréquence de chaque prénom (soit la longueur vécue en moyenne par un nouveau-né), ou de {ctx['avg_length_unweighted_overall']} caractères si l'on fait la moyenne simple de tous les prénoms différents donnés cette année-là, sans tenir compte de leur popularité. Chez les femmes, la longueur pondérée par la fréquence est légèrement plus importante ({ctx['avg_length_weighted_female']} caractères) que chez les hommes ({ctx['avg_length_weighted_male']}).</p>
-""".strip()
-
-    de = f"""
-<p><strong>Welches waren die beliebtesten Vornamen im Jahr {year}? Und wie haben sich die Trends über die Jahrzehnte entwickelt? Entdecken Sie es mit unserem interaktiven Tool.</strong></p>
-
-<h2>Die Namen des Jahres {year}</h2>
-
-<p>Hier sind die Stars von {year}: <strong>{ctx['national_female_1']}</strong> und <strong>{ctx['national_male_1']}</strong> sind die Namen, die Neugeborenen in der Schweiz im vergangenen Jahr am häufigsten gegeben wurden.</p>
-
-<p><strong>{ctx['national_male_1']}</strong> behält den ersten Platz, wie in früheren Jahren, in denen er die Rankings dominierte. Die Top 3 blieben stabil: <strong>{ctx['national_male_1']}</strong> wird noch immer von <strong>{ctx['national_male_2']}</strong> und <strong>{ctx['national_male_3']}</strong> auf nationaler Ebene gefolgt.</p>
-
-<p>Bei den Mädchen nimmt <strong>{ctx['national_female_1']}</strong> den ersten Platz ein, gefolgt von <strong>{ctx['national_female_2']}</strong> und <strong>{ctx['national_female_3']}</strong>. Dies repräsentiert die aktuellen Präferenztrends für weibliche Vornamen.</p>
-
-<h2>Wer steigt, wer fällt?</h2>
-
-<p>Welche Namen steigen am meisten? Da sind <strong>{ctx['female_climber']}</strong> bei den Mädchen und <strong>{ctx['male_climber']}</strong> bei den Jungen. Das sind die Namen, die die meisten Plätze im Ranking gewonnen haben. Sie sind zwischen {prev_year} und {year} um {ctx['female_climber_gain']} bzw. {ctx['male_climber_gain']} Plätze gestiegen.</p>
-
-{movers_table_html(climbers_top, "de", prev_year, year)}
-
-<p>Unter den Namen, die gefallen sind, gibt es <strong>{ctx['female_faller']}</strong> bei den Mädchen und <strong>{ctx['male_faller']}</strong> bei den Jungen. Sie haben jeweils mehr als {ctx['female_faller_loss']} bzw. {ctx['male_faller_loss']} Plätze verloren.</p>
-
-{movers_table_html(fallers_top, "de", prev_year, year)}
-
-<h2>Die Neuankömmlinge</h2>
-
-<p>Unter den Neueinsteigern in die Top 100 der beliebtesten Namen für Neugeborene finden wir nun {ctx['new_entries_text']}.</p>
-
-<h2>Regionale Unterschiede</h2>
-
-<p>Die beliebtesten Namen in {year} sind nicht überall gleich: In der Deutschschweiz belegen <strong>{ctx['alemanique_male_1']}</strong> und <strong>{ctx['alemanique_female_1']}</strong> den ersten Platz, aber in der Romandie stehen <strong>{ctx['romande_male_1']}</strong> und <strong>{ctx['romande_female_1']}</strong> an der Spitze der Rangliste. In der italienischsprachigen Schweiz belegen <strong>{ctx['italienne_male_1']}</strong> und <strong>{ctx['italienne_female_1']}</strong> den ersten Platz auf dem Podium.</p>
-
-<h2>Die häufigsten Vornamen der Schweiz</h2>
-
-<p>Auch wenn der Name <strong>{ctx['most_common_female']}</strong> an Boden verliert, bleibt er der am weitesten verbreitete weibliche Vorname in der Gesamtbevölkerung, mit fast {fmt_ch(ctx['most_common_female_count'])} Frauen, die diesen Namen tragen, gegenüber {fmt_ch(ctx['most_common_female_count_prev'])} im Vorjahr.</p>
-
-<p>Bei den Männern ist <strong>{ctx['most_common_male']}</strong> immer noch der häufigste Name in der Schweiz. Fast {fmt_ch(ctx['most_common_male_count'])} Männer und Jungen heissen so, gegenüber {fmt_ch(ctx['most_common_male_count_prev'])} in {prev_year}.</p>
-
-<h2>Werden die Vornamen kürzer?</h2>
-
-<p>Mit <strong>{ctx['national_female_1']}</strong> und <strong>{ctx['national_male_1']}</strong> wurden im Jahr {year} erneut zwei kurze Namen am häufigsten vergeben. Die durchschnittliche Vornamenslänge der im Jahr {year} Geborenen liegt bei {ctx['avg_length_weighted_overall']} Zeichen, wenn man die Häufigkeit jedes Namens berücksichtigt (also die Länge, die ein durchschnittliches Neugeborenes tatsächlich trägt), oder bei {ctx['avg_length_unweighted_overall']} Zeichen, wenn man einfach den Durchschnitt über alle im Jahr vergebenen unterschiedlichen Namen bildet, unabhängig von ihrer Häufigkeit. Bei Frauen ist die (häufigkeitsgewichtete) Länge mit {ctx['avg_length_weighted_female']} Zeichen etwas umfangreicher als bei den Männern mit {ctx['avg_length_weighted_male']}.</p>
-""".strip()
-
-    en = f"""
-<p><strong>What were the most popular first names in {year}? And how have trends evolved over the decades? Discover it with our interactive tool.</strong></p>
-
-<h2>The names of {year}</h2>
-
-<p>Here are the stars of {year}: <strong>{ctx['national_female_1']}</strong> and <strong>{ctx['national_male_1']}</strong> are the names that were most often given to newborns in Switzerland last year.</p>
-
-<p><strong>{ctx['national_male_1']}</strong> maintains first place, as in previous years when it dominated the rankings. The top 3 has remained stable: <strong>{ctx['national_male_1']}</strong> is still followed by <strong>{ctx['national_male_2']}</strong> and <strong>{ctx['national_male_3']}</strong> at the national level.</p>
-
-<p>Among girls, <strong>{ctx['national_female_1']}</strong> takes first place, followed by <strong>{ctx['national_female_2']}</strong> and <strong>{ctx['national_female_3']}</strong>. This represents the current preference trends for female names.</p>
-
-<h2>Who's climbing, who's falling?</h2>
-
-<p>What are the names that are climbing the most? There are <strong>{ctx['female_climber']}</strong> among girls and <strong>{ctx['male_climber']}</strong> among boys. These are the names that have gained the most places in the rankings. They progressed by {ctx['female_climber_gain']} and {ctx['male_climber_gain']} places respectively between {prev_year} and {year}.</p>
-
-{movers_table_html(climbers_top, "en", prev_year, year)}
-
-<p>Among the names that have fallen, there are <strong>{ctx['female_faller']}</strong> among girls and <strong>{ctx['male_faller']}</strong> among boys. They lost more than {ctx['female_faller_loss']} and {ctx['male_faller_loss']} places respectively.</p>
-
-{movers_table_html(fallers_top, "en", prev_year, year)}
-
-<h2>The newcomers</h2>
-
-<p>Among the newcomers in the top 100 of the most popular names for newborns, we now find {ctx['new_entries_text']}.</p>
-
-<h2>Regional differences</h2>
-
-<p>The most popular names in {year} are not the same everywhere: in German-speaking Switzerland, <strong>{ctx['alemanique_male_1']}</strong> and <strong>{ctx['alemanique_female_1']}</strong> occupy first place, but in French-speaking Switzerland, <strong>{ctx['romande_male_1']}</strong> and <strong>{ctx['romande_female_1']}</strong> are at the top of the rankings. In Italian-speaking Switzerland, <strong>{ctx['italienne_male_1']}</strong> and <strong>{ctx['italienne_female_1']}</strong> occupy first place on the podium.</p>
-
-<h2>The most common names in Switzerland</h2>
-
-<p>Even if the name <strong>{ctx['most_common_female']}</strong> is losing ground, it remains the most widespread female name in the entire population, with nearly {fmt_en(ctx['most_common_female_count'])} women bearing this name, compared to {fmt_en(ctx['most_common_female_count_prev'])} the previous year.</p>
-
-<p>Among men, <strong>{ctx['most_common_male']}</strong> is still the most frequent name in Switzerland. Nearly {fmt_en(ctx['most_common_male_count'])} men and boys are called this, compared to {fmt_en(ctx['most_common_male_count_prev'])} in {prev_year}.</p>
-
-<h2>Are names getting shorter?</h2>
-
-<p>With <strong>{ctx['national_female_1']}</strong> and <strong>{ctx['national_male_1']}</strong>, these are once again two short names that were most often given in {year}. The average length of first names given in {year} is {ctx['avg_length_weighted_overall']} characters when weighted by how often each name was used (i.e. the length actually experienced by an average newborn), or {ctx['avg_length_unweighted_overall']} characters as a simple average across every distinct name given that year, regardless of popularity. Among women, the frequency-weighted length is slightly longer ({ctx['avg_length_weighted_female']} characters) than among men ({ctx['avg_length_weighted_male']}).</p>
-""".strip()
-
-    return {"fr": fr, "de": de, "en": en}
-
+    return sections
 
 # =============================================================================
-# HTML REPORT (texts + tables in one page, for quick review / copy-paste)
+# HTML REPORT / STANDALONE ARTICLE PAGES
 # =============================================================================
 
-REPORT_CSS = """
+ARTICLE_PAGE_CSS = """
 body { font-family: -apple-system, Arial, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1a1a1a; }
-h1 { font-size: 1.6rem; } h2 { font-size: 1.25rem; margin-top: 2.5rem; border-bottom: 2px solid #ddd; padding-bottom: .3rem; }
-h3 { font-size: 1.05rem; margin-top: 1.5rem; color: #444; }
-table { border-collapse: collapse; width: 100%; margin: .75rem 0 1.5rem; font-size: .9rem; }
+h1 { font-size: 1.6rem; }
+h2 { font-size: 1.2rem; margin-top: 2.5rem; border-bottom: 2px solid #ddd; padding-bottom: .3rem; }
+h4 { font-size: .9rem; margin: 1.25rem 0 .3rem; color: #555; }
+table { border-collapse: collapse; width: 100%; margin: .25rem 0 1.25rem; font-size: .87rem; }
 th, td { border: 1px solid #ddd; padding: .4rem .6rem; text-align: left; }
 th { background: #f5f5f5; }
-tr:nth-child(even) { background: #fafafa; }
-.article-block { background: #f8f8f8; border: 1px solid #ddd; border-radius: 6px; padding: 1rem 1.25rem; margin: .75rem 0 1.5rem; }
+.text-block { background: #f4f4f4; border-left: 4px solid #888; border-radius: 4px; padding: 1rem 1.25rem; margin: .5rem 0 1.25rem; font-family: 'SF Mono', Consolas, monospace; font-size: .92rem; white-space: pre-wrap; word-break: break-word; }
+.lang-block { margin-top: 3.5rem; padding-top: 1.5rem; border-top: 4px solid #333; }
 """
+
+
+def markdown_bold_to_html(text: str) -> str:
+    """Converts **name** markers to real <strong> tags (escaping everything
+    else first, so this is still safe against stray HTML-special characters).
+    Real <strong> tags - not visible literal tag text - are what let a
+    browser copy preserve bold via the rich-text (text/html) clipboard when
+    pasted into a CMS that accepts rich text."""
+    escaped = escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+
+
+def render_text_block(text: str) -> str:
+    return f"<pre class='text-block'>{markdown_bold_to_html(text)}</pre>"
+
+
+def render_sections_body(sections: list) -> str:
+    parts = []
+    for section in sections:
+        if section.get("label"):
+            parts.append(f"<h2>{section['label']}</h2>")
+        parts.append(render_text_block(section["text"]))
+        for table_title, table_html in section.get("tables", []):
+            parts.append(f"<h4>{table_title}</h4>{table_html}")
+    return "\n".join(parts)
+
+
+def build_article_page_html(lang_label: str, sections: list) -> str:
+    body = f"<h1>{lang_label} - {DATA_YEAR}</h1>" + render_sections_body(sections)
+    return f"<!doctype html><html><head><meta charset='utf-8'><title>{lang_label} {DATA_YEAR}</title><style>{ARTICLE_PAGE_CSS}</style></head><body>{body}</body></html>"
 
 
 def df_to_html(df: pd.DataFrame) -> str:
     return df.to_html(index=False, border=0, na_rep="-")
 
 
-def build_report_html(articles: dict, tables: dict) -> str:
-    sections = [f"<h1>Swiss First Names Analysis - {DATA_YEAR}</h1>"]
+def build_report_html(sections_by_lang: dict, tables: dict) -> str:
+    parts = [f"<h1>Swiss First Names Analysis - {DATA_YEAR}</h1>"]
 
-    sections.append("<h2>Automated article text</h2>")
-    for lang, label in [("fr", "Français"), ("de", "Deutsch"), ("en", "English")]:
-        sections.append(f"<h3>{label}</h3><div class='article-block'>{articles[lang]}</div>")
+    for lang, label in [("fr", "Français"), ("de", "Deutsch")]:
+        parts.append(f"<div class='lang-block'><h1>{label}</h1>{render_sections_body(sections_by_lang[lang])}</div>")
 
-    sections.append("<h2>Top climbers / fallers (national ranking, births)</h2>")
-    sections.append(f"<h3>Top climbers</h3>{df_to_html(tables['climbers'])}")
-    sections.append(f"<h3>Top fallers</h3>{df_to_html(tables['fallers'])}")
-    sections.append(f"<h3>New entries in the top {TOP_N_DISPLAY}</h3>{df_to_html(tables['new_entries'])}")
-    sections.append(f"<h3>Exits from the top {TOP_N_DISPLAY}</h3>{df_to_html(tables['exits'])}")
+    parts.append("<div class='lang-block'><h1>Reference tables (background data, not for publication)</h1>")
+    parts.append(f"<h2>Top climbers (10/gender)</h2>{df_to_html(tables['climbers'])}")
+    parts.append(f"<h2>Top fallers (10/gender)</h2>{df_to_html(tables['fallers'])}")
+    parts.append(f"<h2>New entries in the top {TOP_N_DISPLAY}</h2>{df_to_html(tables['new_entries'])}")
+    parts.append(f"<h2>Exits from the top {TOP_N_DISPLAY}</h2>{df_to_html(tables['exits'])}")
+    parts.append(f"<h2>National top 3</h2>{df_to_html(tables['rankings_national'])}")
+    parts.append(f"<h2>Regional top 3</h2>{df_to_html(tables['rankings_regional'])}")
+    parts.append(f"<h2>Most common names (population)</h2>{df_to_html(tables['most_common'])}")
+    parts.append("</div>")
 
-    sections.append("<h2>National &amp; regional top 3 (births)</h2>")
-    sections.append(f"<h3>National</h3>{df_to_html(tables['rankings_national'])}")
-    sections.append(f"<h3>Regional</h3>{df_to_html(tables['rankings_regional'])}")
-
-    sections.append("<h2>Most common names (total living population)</h2>")
-    sections.append(df_to_html(tables['most_common']))
-
-    body = "\n".join(sections)
-    return f"<!doctype html><html><head><meta charset='utf-8'><title>Baby names report {DATA_YEAR}</title><style>{REPORT_CSS}</style></head><body>{body}</body></html>"
+    body = "\n".join(parts)
+    return f"<!doctype html><html><head><meta charset='utf-8'><title>Baby names report {DATA_YEAR}</title><style>{ARTICLE_PAGE_CSS}</style></head><body>{body}</body></html>"
 
 
 # =============================================================================
@@ -710,6 +1338,9 @@ def main():
     detect_years(rankings)
 
     data = load_population_data()
+
+    quality_log = run_data_quality_checks(px_female, px_male, data)
+    write_data_quality_log(quality_log)
 
     # --- national & regional top 3 --------------------------------------
     national_male = top_n(rankings, NATIONAL_REGION, "male", DATA_YEAR, 3)
@@ -731,19 +1362,78 @@ def main():
         ignore_index=True,
     )[["gender", "prenom", "value", "custom_rank"]]
 
+    # --- leader continuity narrative ("years as #1", continuing/returning/first time) ---
+    national_male_1_count = int(national_male["value"].iloc[0])
+    national_female_1_count = int(national_female["value"].iloc[0])
+
+    national_male_prev3 = top_n(rankings, NATIONAL_REGION, "male", COMPARISON_YEAR, 3)
+    national_female_prev3 = top_n(rankings, NATIONAL_REGION, "female", COMPARISON_YEAR, 3)
+    male_podium_unchanged = (
+        len(national_male_prev3) >= 3
+        and set(national_male_prev3["prenom"].iloc[1:3]) == set(national_male["prenom"].iloc[1:3])
+    )
+    female_podium_unchanged = (
+        len(national_female_prev3) >= 3
+        and set(national_female_prev3["prenom"].iloc[1:3]) == set(national_female["prenom"].iloc[1:3])
+    )
+
+    male_history = leader_history(rankings, "male", national_male["prenom"].iloc[0], DATA_YEAR)
+    female_history = leader_history(rankings, "female", national_female["prenom"].iloc[0], DATA_YEAR)
+
+    # Bold markers (**name**) around every name mention - see markdown_bold_to_html().
+    def b(name) -> str:
+        return f"**{name}**"
+
+    male1_b, male2_b, male3_b = (b(national_male["prenom"].iloc[i]) for i in range(3))
+    female1_b, female2_b, female3_b = (b(national_female["prenom"].iloc[i]) for i in range(3))
+
+    male_leader_text_fr = leader_paragraph_fr(
+        male1_b, male_history, male2_b, male3_b, DATA_YEAR, male_podium_unchanged,
+    )
+    female_leader_text_fr = leader_paragraph_fr(
+        female1_b, female_history, female2_b, female3_b, DATA_YEAR, female_podium_unchanged,
+        lead_sentence=f"Chez les filles, {female1_b} prend la tête du classement, devant {female2_b} et {female3_b}.",
+    )
+    male_leader_text_de = leader_paragraph_de(
+        male1_b, "male", male_history, male2_b, male3_b, DATA_YEAR, male_podium_unchanged,
+    )
+    female_leader_text_de = leader_paragraph_de(
+        female1_b, "female", female_history, female2_b, female3_b, DATA_YEAR, female_podium_unchanged,
+        lead_sentence=f"Bei den Mädchen ist {female1_b} neu an erster Stelle, gefolgt von {female2_b} und {female3_b}.",
+    )
+
+    # --- national top-10-over-10-years evolution --------------------------
+    evolution_male = national_evolution_table(rankings, "male")
+    evolution_female = national_evolution_table(rankings, "female")
+
     # --- year-over-year rank changes --------------------------------------
     changes = build_rank_changes(rankings)
     climbers, fallers = climbers_and_fallers(changes, n=10)
     new_entries, exits = new_entries_and_exits(changes)
+
+    for label, df in [("climbers", climbers), ("fallers", fallers), ("new_entries", new_entries)]:
+        for gender in ("male", "female"):
+            if df[df["gender"] == gender].empty:
+                raise RuntimeError(
+                    f"No {gender} names found for '{label}' this year - the article text "
+                    f"generation assumes at least one per gender. This would need a manual "
+                    f"look at the {DATA_YEAR} vs {COMPARISON_YEAR} data before the script can "
+                    f"produce a paragraph for that section."
+                )
 
     male_climber = climbers[climbers["gender"] == "male"].head(1)
     female_climber = climbers[climbers["gender"] == "female"].head(1)
     male_faller = fallers[fallers["gender"] == "male"].head(1)
     female_faller = fallers[fallers["gender"] == "female"].head(1)
 
-    # Concise tables embedded directly in the article text (TOP_N_MOVERS_IN_ARTICLE per gender).
-    climbers_top = climbers.groupby("gender", group_keys=False).head(TOP_N_MOVERS_IN_ARTICLE)
-    fallers_top = fallers.groupby("gender", group_keys=False).head(TOP_N_MOVERS_IN_ARTICLE)
+    # Split by gender for the article's own tables (TOP_N_MOVERS_IN_ARTICLE per gender).
+    climbers_male = climbers[climbers["gender"] == "male"].head(TOP_N_MOVERS_IN_ARTICLE)
+    climbers_female = climbers[climbers["gender"] == "female"].head(TOP_N_MOVERS_IN_ARTICLE)
+    fallers_male = fallers[fallers["gender"] == "male"].head(TOP_N_MOVERS_IN_ARTICLE)
+    fallers_female = fallers[fallers["gender"] == "female"].head(TOP_N_MOVERS_IN_ARTICLE)
+
+    new_entries_male_top = new_entries[new_entries["gender"] == "male"].head(TOP_N_NEW_ENTRIES_IN_ARTICLE)
+    new_entries_female_top = new_entries[new_entries["gender"] == "female"].head(TOP_N_NEW_ENTRIES_IN_ARTICLE)
 
     # Full year-over-year rank changes for every name in the analysis pool (not just the top movers).
     rank_changes_full = changes[
@@ -754,6 +1444,20 @@ def main():
         new_entries[new_entries["gender"] == "male"]["prenom"].head(2).tolist()
         + new_entries[new_entries["gender"] == "female"]["prenom"].head(2).tolist()
     )
+
+    male_new_entry = new_entries[new_entries["gender"] == "male"].head(1)
+    female_new_entry = new_entries[new_entries["gender"] == "female"].head(1)
+
+    def row0(df, col):
+        return df[col].iloc[0] if len(df) else None
+
+    female_faller_loss = int(row0(female_faller, "rank_current")) - int(row0(female_faller, "rank_prev"))
+    male_faller_loss = int(row0(male_faller, "rank_current")) - int(row0(male_faller, "rank_prev"))
+    fallers_min_loss = min(female_faller_loss, male_faller_loss)
+    # If the smaller loss is itself under 10, rounding down to the nearest
+    # ten would give 0 - "plus de 0 rangs" is nonsense, so fall back to the
+    # exact number in that (rare, small-swing) case.
+    fallers_min_loss_rounded = round_down_to_ten(fallers_min_loss) or fallers_min_loss
 
     # --- total population analysis ----------------------------------------
     all_current = pd.concat([data["all_female_current"], data["all_male_current"]], ignore_index=True)
@@ -770,46 +1474,73 @@ def main():
     ))
 
     # --- assemble article context ---------------------------------------
-    def safe(series, col, default="-"):
-        return series[col] if len(series) else default
-
     ctx = {
         "data_year": DATA_YEAR,
         "comparison_year": COMPARISON_YEAR,
-        "national_male_1": national_male["prenom"].iloc[0],
-        "national_male_2": national_male["prenom"].iloc[1],
-        "national_male_3": national_male["prenom"].iloc[2],
-        "national_female_1": national_female["prenom"].iloc[0],
-        "national_female_2": national_female["prenom"].iloc[1],
-        "national_female_3": national_female["prenom"].iloc[2],
-        "alemanique_male_1": regional_top1[("alemanique", "male")],
-        "alemanique_female_1": regional_top1[("alemanique", "female")],
-        "romande_male_1": regional_top1[("romande", "male")],
-        "romande_female_1": regional_top1[("romande", "female")],
-        "italienne_male_1": regional_top1[("italienne", "male")],
-        "italienne_female_1": regional_top1[("italienne", "female")],
-        "male_climber": safe(male_climber.squeeze(), "prenom"),
-        "male_climber_gain": int(safe(male_climber.squeeze(), "rank_change", 0)),
-        "female_climber": safe(female_climber.squeeze(), "prenom"),
-        "female_climber_gain": int(safe(female_climber.squeeze(), "rank_change", 0)),
-        "male_faller": safe(male_faller.squeeze(), "prenom"),
-        "male_faller_loss": abs(int(safe(male_faller.squeeze(), "rank_change", 0))),
-        "female_faller": safe(female_faller.squeeze(), "prenom"),
-        "female_faller_loss": abs(int(safe(female_faller.squeeze(), "rank_change", 0))),
-        "new_entries_text": ", ".join(new_entries_sample),
-        "most_common_male": male_most_common["firstname"].iloc[0],
-        "most_common_male_count": male_most_common["total_population_current"].iloc[0],
-        "most_common_male_count_prev": male_most_common["total_population_previous"].iloc[0],
-        "most_common_female": female_most_common["firstname"].iloc[0],
-        "most_common_female_count": female_most_common["total_population_current"].iloc[0],
-        "most_common_female_count_prev": female_most_common["total_population_previous"].iloc[0],
-        "avg_length_weighted_overall": length["weighted"]["overall"],
-        "avg_length_weighted_male": length["weighted"]["male"],
-        "avg_length_weighted_female": length["weighted"]["female"],
-        "avg_length_unweighted_overall": length["unweighted"]["overall"],
+        "national_male_1": male1_b,
+        "national_male_1_count": national_male_1_count,
+        "national_female_1": female1_b,
+        "national_female_1_count": national_female_1_count,
+        "male_leader_text_fr": male_leader_text_fr,
+        "female_leader_text_fr": female_leader_text_fr,
+        "male_leader_text_de": male_leader_text_de,
+        "female_leader_text_de": female_leader_text_de,
+        "alemanique_male_1": b(regional_top1[("alemanique", "male")]),
+        "alemanique_female_1": b(regional_top1[("alemanique", "female")]),
+        "romande_male_1": b(regional_top1[("romande", "male")]),
+        "romande_female_1": b(regional_top1[("romande", "female")]),
+        "italienne_male_1": b(regional_top1[("italienne", "male")]),
+        "italienne_female_1": b(regional_top1[("italienne", "female")]),
+        "male_climber": b(row0(male_climber, "prenom")),
+        "male_climber_rank_prev": int(row0(male_climber, "rank_prev")),
+        "male_climber_rank_curr": int(row0(male_climber, "rank_current")),
+        "female_climber": b(row0(female_climber, "prenom")),
+        "female_climber_rank_prev": int(row0(female_climber, "rank_prev")),
+        "female_climber_rank_curr": int(row0(female_climber, "rank_current")),
+        "male_faller": b(row0(male_faller, "prenom")),
+        "male_faller_rank_prev": int(row0(male_faller, "rank_prev")),
+        "male_faller_rank_curr": int(row0(male_faller, "rank_current")),
+        "female_faller": b(row0(female_faller, "prenom")),
+        "female_faller_rank_prev": int(row0(female_faller, "rank_prev")),
+        "female_faller_rank_curr": int(row0(female_faller, "rank_current")),
+        "fallers_min_loss_rounded": fallers_min_loss_rounded,
+        "fallers_min_loss_word_de": number_word_de(fallers_min_loss_rounded),
+        "male_new_entry": b(row0(male_new_entry, "prenom")),
+        "male_new_entry_rank": int(row0(male_new_entry, "rank_current")),
+        "female_new_entry": b(row0(female_new_entry, "prenom")),
+        "female_new_entry_rank": int(row0(female_new_entry, "rank_current")),
+        "new_entries_text": ", ".join(b(n) for n in new_entries_sample),
+        "most_common_male_1": b(male_most_common["firstname"].iloc[0]),
+        "most_common_male_1_rounded": round_nearest(male_most_common["total_population_current"].iloc[0]),
+        "most_common_male_2": b(male_most_common["firstname"].iloc[1]),
+        "most_common_male_2_rounded": round_nearest(male_most_common["total_population_current"].iloc[1]),
+        "most_common_male_3": b(male_most_common["firstname"].iloc[2]),
+        "most_common_male_3_rounded": round_nearest(male_most_common["total_population_current"].iloc[2]),
+        "most_common_female_1": b(female_most_common["firstname"].iloc[0]),
+        "most_common_female_1_rounded": round_nearest(female_most_common["total_population_current"].iloc[0]),
+        "most_common_female_2": b(female_most_common["firstname"].iloc[1]),
+        "most_common_female_2_rounded": round_nearest(female_most_common["total_population_current"].iloc[1]),
+        "most_common_female_3": b(female_most_common["firstname"].iloc[2]),
+        "most_common_female_3_rounded": round_nearest(female_most_common["total_population_current"].iloc[2]),
+        "avg_length_overall_fmt": decimal_comma(length["unweighted"]["overall"], 1),
+        "avg_length_male_fmt": decimal_comma(length["unweighted"]["male"], 2),
+        "avg_length_female_fmt": decimal_comma(length["unweighted"]["female"], 2),
     }
 
-    articles = build_article_texts(ctx, climbers_top, fallers_top)
+    article_tables = {
+        "evolution_male": evolution_male,
+        "evolution_female": evolution_female,
+        "climbers_male": climbers_male,
+        "climbers_female": climbers_female,
+        "fallers_male": fallers_male,
+        "fallers_female": fallers_female,
+        "new_entries_male": new_entries_male_top,
+        "new_entries_female": new_entries_female_top,
+        "regional": rankings_regional,
+        "most_common_male": male_most_common.head(3),
+        "most_common_female": female_most_common.head(3),
+    }
+    article_sections = build_article_sections(ctx, article_tables)
 
     # =============================================================================
     # EXPORT
@@ -817,9 +1548,10 @@ def main():
 
     print(f"\n=== Writing output to {OUTPUT_DIR} ===\n")
 
-    for lang in ("fr", "de", "en"):
+    LANG_LABELS = {"fr": "Français", "de": "Deutsch"}
+    for lang, lang_label in LANG_LABELS.items():
         path = OUTPUT_DIR / f"article_{lang}_{DATA_YEAR}.html"
-        path.write_text(articles[lang], encoding="utf-8")
+        path.write_text(build_article_page_html(lang_label, article_sections[lang]), encoding="utf-8")
         print(f"  wrote {path.name}")
 
     tables = {
@@ -836,6 +1568,9 @@ def main():
         # Every name in the analysis pool, not just the top movers - for further
         # analysis or for the graphics team to build their own visuals from.
         "rank_changes_full": rank_changes_full,
+        # Full 10-year rank history of today's top-10 names (wide: one column per year).
+        "evolution_male": evolution_male.reset_index(),
+        "evolution_female": evolution_female.reset_index(),
     }
     for name, df in tables.items():
         path = OUTPUT_DIR / f"{name}_{DATA_YEAR}.csv"
@@ -847,13 +1582,13 @@ def main():
         df.to_csv(path, index=False)
         print(f"  wrote {path.name}")
 
-    report_html = build_report_html(articles, tables)
+    report_html = build_report_html(article_sections, tables)
     report_path = OUTPUT_DIR / f"report_{DATA_YEAR}.html"
     report_path.write_text(report_html, encoding="utf-8")
     print(f"  wrote {report_path.name}  <- open this one first")
 
     print("\nDone.\n")
-    return ctx, tables, articles
+    return ctx, tables, article_sections
 
 
 if __name__ == "__main__":
