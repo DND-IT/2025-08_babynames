@@ -21,9 +21,10 @@ below.
 
 ## Data Sources
 
-- **PX Web API** (newborn names by region and year): queried directly via the
-  standard PXWebAPI (JSON-stat2 format), not the CSV "saved query" shortlink.
-  See "Why the PXWebAPI and not a CSV export" below - this matters for accented names.
+- **stats.swiss SDMX API** (newborn names by canton and year): queried
+  directly via the standard SDMX REST data endpoint (SDMX-JSON format).
+  This replaced the old PX Web tables in 2026 - see "The 2026 migration to
+  stats.swiss" below.
 - **Swiss Federal Statistical Office (BFS) DAM API** (total living population
   by name): auto-discovered every run, no manual URLs. See "How the
   population data is fetched" below.
@@ -43,30 +44,38 @@ That's it — no Jupyter, no R, no system libraries.
 **None**, in the common case — that's the point. Just run the script every year.
 
 `DATA_YEAR` (the reference year for the whole analysis) is **not** based on
-today's date — it's auto-detected as the most recent year present in the PX
-Web newborn data, since BFS publishes final figures with a lag.
+today's date — it's auto-detected as the most recent year present in the
+newborn-name data, since BFS publishes final figures with a lag.
 
-### Why the PXWebAPI and not a CSV export
+### The 2026 migration to stats.swiss
 
-The CSV "saved query" shortlink (what the R script and an early version of
-this one used) forces the server to encode the file in a single-byte charset
-(`iso-8859-15`). That charset cannot represent every character Swiss-registered
-names actually use - e.g. Czech/Slovak "š" in "Eliška" comes back as a
-mangled placeholder (`Eli¨ka`), even though the underlying BFS data is correct
-(confirmed by downloading the same table as XLSX from the PX Web website,
-which shows it correctly - XLSX is Unicode-native).
+BFS retired the old PX Web tables in 2026 in favor of the new SDMX-based
+"Swiss stats explorer" (`stats.swiss`). `import_px_data()` now queries the
+standard SDMX REST data endpoint directly:
+`https://disseminate.stats.swiss/rest/data/CH1.BEVNAT,<dataflow>,1.0.0/..A.COUNT`
+(one GET per gender, `..A.COUNT` = wildcard GEO, wildcard NAME, annual
+frequency, counts only - "Rang" isn't requested since the script always
+recomputes its own tie-free rank). Response format is SDMX-JSON, UTF-8
+natively, so accented names (e.g. "Eliška") are not at risk of the
+single-byte-charset mangling the old CSV export had.
 
-The fix: query the standard PXWebAPI (`/api/v1/fr/<table>/<table>.px`, POST,
-`response.format: "json-stat2"`) instead. JSON-stat2 is UTF-8 natively, so
-this isn't a workaround, it's just the correct data source. Two side notes
-baked into `import_px_data()`:
+One structural change to be aware of: the new dataflow's `GEO` dimension only
+carries Switzerland-total (code `8100`) and the 26 cantons - the
+pre-aggregated linguistic-region codes still listed in the codelist (German-
+/French-/Italian-/Romansh-speaking Switzerland) carry **no actual data**
+(confirmed: querying them 404s). So `sdmx_json_to_long_df()` rebuilds
+"Suisse alémanique/romande/italienne/romanche" itself, by summing cantons via
+`CANTON_TO_LINGUISTIC_REGION`. Bilingual/trilingual cantons already arrive as
+separate per-language GEO codes (e.g. Bern-German `21` vs Bern-French `22`,
+Graubünden `181`/`183`/`184` for German/Italian/Romansh), so no canton is
+ever double-counted. This also means a 4th region, Romansh-speaking
+Graubünden ("Suisse romanche"), is now tracked - it appears in the regional
+top-3 table but is small enough that it's deliberately not mentioned in the
+FR/DE article prose, which still only discusses the three historical regions.
 
-- The API caps a single query around 100k cells, and one region already uses
-  ~2/3 of that (2668 names × 25 years), so the script queries **one region at
-  a time** (4 regions × 2 genders = 8 requests) rather than all 4 in one call.
-- The query also filters server-side to the "Nombre" (count) unit only, since
-  the script always recomputes its own tie-free rank rather than using BFS's
-  "Rang" unit - this cuts the amount of data transferred too.
+The prénom↔code mapping (`CL_TOP_MALE/FEMALE_FIRSTNAMES`) is a codelist
+versioned by year (e.g. `1.2025.0`) - the script never hardcodes a code, it
+always reads the label embedded in that run's own SDMX-JSON response.
 
 ### How the population data is fetched
 
@@ -144,8 +153,9 @@ the CMS too, without needing to open a file first.
 
 ## Script Structure
 
-- **Config**: paths, thresholds, PXWebAPI table IDs, DAM API content ids.
-- **Import**: PX Web (newborn rankings, via PXWebAPI/JSON-stat2) + BFS DAM
+- **Config**: paths, thresholds, stats.swiss SDMX dataflow IDs, canton→region
+  mapping, DAM API content ids.
+- **Import**: stats.swiss (newborn rankings, via SDMX REST/SDMX-JSON) + BFS DAM
   population snapshots (auto-discovered).
 - **Data quality checks**: see below — run once, after both datasets are loaded.
 - **Rankings**: national/regional top 3, tie-free custom rank, 10-year evolution of today's top 10.
@@ -166,18 +176,19 @@ Every run performs checks and writes them to `data_quality_log_YYYY.txt`
    with no base letter (e.g. a leftover `Eli¨ka` if the data source ever
    regresses), or digits. Deliberately does **not** flag apostrophes, hyphens
    or spaces, since those are legitimate in real Swiss-registered names
-   (`N'Guessan`, `Jean-Pierre`). This should normally come back clean now
-   that PX Web data is fetched via the PXWebAPI (see "Why the PXWebAPI and
-   not a CSV export" above) - if it isn't, that's worth investigating, not ignoring.
-2. **PX Web vs. population census freshness.** PX Web (newborn rankings) and
-   the population census are two independent BFS datasets. This check confirms
-   the population census actually has rows for `yearofbirth == DATA_YEAR` (the
-   year PX Web says is the latest) — if not, the census hasn't caught up yet,
-   and any figure derived from it (most common name, name length) is flagged
-   as unreliable rather than silently used.
+   (`N'Guessan`, `Jean-Pierre`). This should normally come back clean since
+   the stats.swiss SDMX-JSON data is UTF-8 natively (see "The 2026 migration
+   to stats.swiss" above) - if it isn't, that's worth investigating, not ignoring.
+2. **Newborn rankings vs. population census freshness.** The newborn-name
+   rankings and the population census are two independent BFS datasets. This
+   check confirms the population census actually has rows for
+   `yearofbirth == DATA_YEAR` (the year the newborn rankings say is the
+   latest) — if not, the census hasn't caught up yet, and any figure derived
+   from it (most common name, name length) is flagged as unreliable rather
+   than silently used.
 3. **Manual review reminder.** Two paragraphs in `build_article_sections()`
    are static text, never re-verified against data: the name-diversity/
-   individualisation trend (references 1980, but PX Web only goes back to
+   individualisation trend (references 1980, but the data only goes back to
    2000) and the "as shown by our maps" sentence (the script doesn't generate
    maps). The log just reprints a reminder to skim them each year.
 
@@ -206,14 +217,15 @@ the generated text. The two can differ by half a character or more.
 
 ## Troubleshooting
 
-- A PX Web query failure usually means BFS changed the table ID or variable
-  codes — the error message names the table/region. Check
-  `https://www.pxweb.bfs.admin.ch/api/v1/fr/<table_id>/<table_id>.px` (GET,
-  no body) in a browser to see the current variable codes and re-derive the query.
-- A `403 Forbidden` from the PXWebAPI with no clear message usually means a
-  single query exceeded the ~100k-cell limit — this shouldn't happen with the
-  current one-region-at-a-time queries, but would if a region were added
-  without splitting further.
+- A stats.swiss SDMX query failure usually means BFS changed the dataflow ID
+  or dimension codes — the error message names the dataflow. Check
+  `https://disseminate.stats.swiss/rest/dataflow/CH1.BEVNAT/<dataflow_id>/1.0.0?references=all`
+  (GET, `Accept: application/vnd.sdmx.structure+json;charset=utf-8;version=1.0`)
+  in a browser/curl to see the current dimensions and codelists.
+- If a canton code stops appearing in the data (script silently drops it via
+  the `else: continue` in `sdmx_json_to_long_df()`), a linguistic region's
+  total would quietly shrink — check `CANTON_TO_LINGUISTIC_REGION` against
+  the current `CL_KT_LING_DIFF` codelist if regional totals look off.
 - A population download/resolution failure means BFS restructured their DAM
   catalog (rare) — check the content ids in `POPULATION_CONTENT_IDS` still
   resolve by visiting `https://dam-api.bfs.admin.ch/hub/api/dam/assets/<content_id>:latest:fr` in a browser.
@@ -221,7 +233,7 @@ the generated text. The two can differ by half a character or more.
   more than a year old (the script wasn't run last year) — either accept the
   wider comparison window, or delete the file to fall back to the seed value.
 - Check `data_quality_log_YYYY.txt` for names with unexpected characters —
-  should be empty now (see "Why the PXWebAPI and not a CSV export"); if
+  should be empty now (see "The 2026 migration to stats.swiss"); if
   something shows up, it's worth a look rather than assuming it's expected.
 
 ## Notes on the R → Python conversion
@@ -241,4 +253,5 @@ A few things from the original R/Quarto script were deliberately dropped or fixe
 - Replaced the four manually-updated population URLs with automatic
   discovery via the BFS DAM API — the last remaining annual manual step, now gone.
 - Replaced the CSV "saved query" PX Web download (lossy for some accented
-  names) with the PXWebAPI directly.
+  names) with the PXWebAPI directly. (PX Web itself was later retired by BFS
+  in 2026 - see "The 2026 migration to stats.swiss" above.)
