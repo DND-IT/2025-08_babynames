@@ -1,26 +1,26 @@
 {
   "female": {
     "current": {
+      "dam_id": 36752506,
+      "period": "2025",
+      "url": "https://dam-api.bfs.admin.ch/hub/api/dam/assets/36752506/master"
+    },
+    "previous": {
       "dam_id": 36062347,
       "period": "2024",
       "url": "https://dam-api.bfs.admin.ch/hub/api/dam/assets/36062347/master"
-    },
-    "previous": {
-      "dam_id": 32208758,
-      "period": "2023",
-      "url": "https://dam-api.bfs.admin.ch/hub/api/dam/assets/32208758/master"
     }
   },
   "male": {
     "current": {
+      "dam_id": 36752513,
+      "period": "2025",
+      "url": "https://dam-api.bfs.admin.ch/hub/api/dam/assets/36752513/master"
+    },
+    "previous": {
       "dam_id": 36062345,
       "period": "2024",
       "url": "https://dam-api.bfs.admin.ch/hub/api/dam/assets/36062345/master"
-    },
-    "previous": {
-      "dam_id": 32208755,
-      "period": "2023",
-      "url": "https://dam-api.bfs.admin.ch/hub/api/dam/assets/32208755/master"
     }
   }
 }

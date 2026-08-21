@@ -2,9 +2,9 @@
 Swiss First Names Analysis - Automated Annual Report
 Author: Olaf Koenig
 
-Downloads newborn-name rankings (PX Web, automatic) and total-population
-name counts (BFS DAM API, auto-discovered) for Switzerland, computes
-rankings, year-over-year changes and a few key stats, then generates
+Downloads newborn-name rankings (stats.swiss SDMX API, automatic) and
+total-population name counts (BFS DAM API, auto-discovered) for Switzerland,
+computes rankings, year-over-year changes and a few key stats, then generates
 ready-to-paste article text in FR/DE/EN plus a handful of CSV/HTML tables.
 
 Requirements: Python 3.8+, pandas, requests (see requirements.txt).
@@ -53,12 +53,17 @@ EVOLUTION_N_YEARS = 10
 FORCE_REDOWNLOAD = True
 
 # Linguistic regions as labelled by the BFS data (kept in French - it's the
-# raw data value, not display text).
+# raw data value, not display text). "romanche" is new: the stats.swiss
+# dataflow no longer publishes pre-aggregated linguistic-region totals (see
+# CANTON_TO_LINGUISTIC_REGION below), so regions are rebuilt from cantons and
+# Romansh-speaking Graubünden can be kept as its own (tiny) region instead of
+# being folded into another one.
 NATIONAL_REGION = "Suisse"
 LINGUISTIC_REGIONS = {
     "alemanique": "Suisse alémanique",
     "romande": "Suisse romande",
     "italienne": "Suisse italienne",
+    "romanche": "Suisse romanche",
 }
 
 # Paths (relative to this script, so it runs the same regardless of the
@@ -72,23 +77,42 @@ OUTPUT_DIR = None
 for directory in (INPUT_RAW_DIR, INPUT_PROCESSED_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
-# PX Web (automatic - full historical newborn-name series, stable table IDs,
-# never need updating). Uses the standard PXWebAPI v1 (JSON-stat2, native
-# Unicode) rather than the "saved query" CSV shortlink: the CSV export is
-# forced to a single-byte charset (iso-8859-15) server-side, which cannot
-# represent some real Swiss names (e.g. Czech/Slovak "š" in "Eliška") - the
-# API doesn't have that problem, and also lets us ask for only the regions
-# and unit-of-measure we actually use instead of downloading everything.
-PX_API_BASE = "https://www.pxweb.bfs.admin.ch/api/v1/fr"
-PX_TABLE_IDS = {"female": "px-x-0104050000_102", "male": "px-x-0104050000_101"}
-# BFS's internal codes for the 4 regions we use (Suisse = NATIONAL_REGION,
-# the other 3 = LINGUISTIC_REGIONS below) and for "Nombre" (counts, as
-# opposed to "Rang" which we never use since custom_rank is computed ourselves).
-PX_REGION_CODES = {"Suisse": "CH", "Suisse alémanique": "DD", "Suisse romande": "FF", "Suisse italienne": "II"}
-PX_COUNT_UNIT_CODE = "C"
-# The PXWebAPI backend caps a single query around 100k cells (2668 names x 25
-# years already uses ~2/3 of that) - one query per region keeps every request
-# comfortably under the limit instead of hitting a generic 403.
+# stats.swiss SDMX REST API (automatic - full historical newborn-name series,
+# stable dataflow IDs, never need updating). BFS migrated the old PX Web
+# tables here in 2026; this is the standard SDMX-JSON data format (native
+# Unicode, so no encoding issues like the PX Web CSV export used to have).
+SDMX_API_BASE = "https://disseminate.stats.swiss/rest"
+SDMX_AGENCY = "CH1.BEVNAT"
+SDMX_DATAFLOW_IDS = {"female": "DF_BEVNAT_PRENOMS_2", "male": "DF_BEVNAT_PRENOMS_1"}
+SDMX_DATAFLOW_VERSION = "1.0.0"
+SDMX_DATA_HEADERS = {"Accept": "application/vnd.sdmx.data+json;charset=utf-8;version=1.0"}
+# Query key is GEO.NAME.FREQ.UNIT; empty segments mean "all values for this
+# dimension" (SDMX REST wildcard). We ask for annual frequency and raw counts
+# only - "Rang" isn't requested since custom_rank is computed ourselves.
+SDMX_DATA_KEY = "..A.COUNT"
+
+# Unlike the old PX Web table, the GEO dimension here only carries
+# Switzerland-total (code 8100) and the 26 cantons - the codelist still lists
+# pre-aggregated linguistic-region codes (1/2/3/4), but they carry no actual
+# data (confirmed: querying them 404s). So the 3(+1) linguistic regions used
+# throughout this script are rebuilt here by summing cantons into their
+# language group. Bilingual/trilingual cantons already arrive as separate
+# per-language GEO codes (e.g. Bern-German 21 vs Bern-French 22, Fribourg 101
+# vs 102, Valais 231 vs 232, Jura 261 vs 262, Graubünden 181/183/184 for
+# German/Italian/Romansh), so no canton is ever double-counted across regions.
+CANTON_TO_LINGUISTIC_REGION = {
+    "11": "alemanique", "21": "alemanique", "31": "alemanique", "41": "alemanique",
+    "51": "alemanique", "61": "alemanique", "71": "alemanique", "81": "alemanique",
+    "91": "alemanique", "101": "alemanique", "111": "alemanique", "121": "alemanique",
+    "131": "alemanique", "141": "alemanique", "151": "alemanique", "161": "alemanique",
+    "171": "alemanique", "181": "alemanique", "191": "alemanique", "201": "alemanique",
+    "231": "alemanique", "261": "alemanique",
+    "22": "romande", "102": "romande", "222": "romande", "232": "romande",
+    "242": "romande", "252": "romande", "262": "romande",
+    "213": "italienne", "183": "italienne",
+    "184": "romanche",
+}
+SDMX_NATIONAL_GEO_CODE = "8100"
 
 # Total-population-by-name snapshots (used for "most common name overall").
 # No manual URL to maintain: BFS assigns each dataset a stable contentId that
@@ -202,84 +226,71 @@ def save_population_state(state: dict) -> None:
     POPULATION_STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def fetch_px_json_stat(table_id: str, region_code: str) -> dict:
-    """One region at a time (see PX_REGION_CODES comment above for why)."""
-    url = f"{PX_API_BASE}/{table_id}/{table_id}.px"
-    query = {
-        "query": [
-            {"code": "Vorname", "selection": {"filter": "all", "values": ["*"]}},
-            {"code": "Sprachregion / Kanton", "selection": {"filter": "item", "values": [region_code]}},
-            {"code": "Masseinheit", "selection": {"filter": "item", "values": [PX_COUNT_UNIT_CODE]}},
-            {"code": "Jahr", "selection": {"filter": "all", "values": ["*"]}},
-        ],
-        "response": {"format": "json-stat2"},
-    }
+def fetch_sdmx_data(gender: str) -> dict:
+    """One request per gender - wildcard query for all GEO codes (Switzerland
+    + 26 cantons) and all NAME codes, annual counts only (see SDMX_DATA_KEY)."""
+    dataflow_id = SDMX_DATAFLOW_IDS[gender]
+    url = f"{SDMX_API_BASE}/data/{SDMX_AGENCY},{dataflow_id},{SDMX_DATAFLOW_VERSION}/{SDMX_DATA_KEY}"
     try:
-        response = requests.post(url, json=query, timeout=60)
+        response = requests.get(url, headers=SDMX_DATA_HEADERS, timeout=120)
         response.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(
-            f"PX Web API query failed for table {table_id}, region {region_code}.\n"
+            f"stats.swiss SDMX API query failed for dataflow {dataflow_id}.\n"
             f"Original error: {exc}"
         ) from exc
     return response.json()
 
 
-def json_stat_to_long_df(payload: dict, region_label: str, gender: str) -> pd.DataFrame:
-    """Flattens one JSON-stat2 cube (dims: Vorname x region x unit x Jahr,
-    with region/unit fixed to a single value by the query) into a long
-    dataframe: prenom, region_linguistique_canton, year, value, gender.
-    Written generically against dimension order/sizes rather than assuming
-    this table's exact shape, so a harmless BFS reordering wouldn't break it."""
-    dims = payload["id"]
-    sizes = payload["size"]
-    values = payload["value"]
+def sdmx_json_to_long_df(payload: dict, gender: str) -> pd.DataFrame:
+    """Flattens one SDMX-JSON data message (dims: GEO x NAME x FREQ x UNIT,
+    FREQ/UNIT fixed to a single value by the query) into a long dataframe:
+    prenom, region_linguistique_canton, year, value, gender. Cantons are
+    summed into their linguistic region here (see CANTON_TO_LINGUISTIC_REGION
+    above); Switzerland-total (8100) is used as-is. Written generically
+    against the dimensions' declared order/ids rather than assuming fixed
+    positions, so a harmless BFS reordering wouldn't break it."""
+    dims = payload["data"]["structure"]["dimensions"]
+    series_dims = dims["series"]  # order matches series-key segment order (SDMX-JSON spec)
+    geo_pos = next(i for i, d in enumerate(series_dims) if d["id"] == "GEO")
+    name_pos = next(i for i, d in enumerate(series_dims) if d["id"] == "NAME")
+    geo_values = series_dims[geo_pos]["values"]
+    name_values = series_dims[name_pos]["values"]
 
-    categories = []
-    for dim in dims:
-        cat = payload["dimension"][dim]["category"]
-        labels = cat["label"]
-        index = cat.get("index")
-        if index is None:
-            categories.append([next(iter(labels.values()))])
-        else:
-            pos_to_code = {pos: code for code, pos in index.items()}
-            categories.append([labels[pos_to_code[i]] for i in range(len(pos_to_code))])
-
-    name_dim, year_dim = dims.index("Vorname"), dims.index("Jahr")
+    obs_dim = next(d for d in dims["observation"] if d["id"] == "TIME_PERIOD")
+    obs_years = [int(v["id"]) for v in obs_dim["values"]]
 
     rows = []
-    for flat_i, value in enumerate(values):
-        if value is None:
-            continue
-        remainder, coords = flat_i, [0] * len(dims)
-        for d in range(len(dims) - 1, -1, -1):
-            coords[d] = remainder % sizes[d]
-            remainder //= sizes[d]
-        rows.append((categories[name_dim][coords[name_dim]], int(categories[year_dim][coords[year_dim]]), value))
+    for series_key, series in payload["data"]["dataSets"][0]["series"].items():
+        indices = [int(x) for x in series_key.split(":")]
+        geo_code = geo_values[indices[geo_pos]]["id"]
+        if geo_code == SDMX_NATIONAL_GEO_CODE:
+            region_label = NATIONAL_REGION
+        elif geo_code in CANTON_TO_LINGUISTIC_REGION:
+            region_label = LINGUISTIC_REGIONS[CANTON_TO_LINGUISTIC_REGION[geo_code]]
+        else:
+            continue  # unmapped GEO code - shouldn't happen, see CANTON_TO_LINGUISTIC_REGION comment
+        prenom = name_values[indices[name_pos]]["name"]
+        for obs_i, obs in series["observations"].items():
+            rows.append((prenom, region_label, obs_years[int(obs_i)], obs[0]))
 
-    df = pd.DataFrame(rows, columns=["prenom", "year", "value"])
-    df["region_linguistique_canton"] = region_label
+    df = pd.DataFrame(rows, columns=["prenom", "region_linguistique_canton", "year", "value"])
+    df = df.groupby(["prenom", "region_linguistique_canton", "year"], as_index=False)["value"].sum()
     df["gender"] = gender
     return df
 
 
 def import_px_data(gender: str) -> pd.DataFrame:
-    """All 4 regions we use, for one gender, via the PX Web API (see
-    PX_TABLE_IDS/PX_REGION_CODES above)."""
-    table_id = PX_TABLE_IDS[gender]
-    frames = []
-    for region_label, region_code in PX_REGION_CODES.items():
-        cache_path = INPUT_RAW_DIR / f"px_{gender}_{region_code}.json"
-        if cache_path.exists() and not FORCE_REDOWNLOAD:
-            print(f"  (skip download, already have {cache_path.name})")
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        else:
-            print(f"Querying PX Web API: {gender} / {region_label} ...")
-            payload = fetch_px_json_stat(table_id, region_code)
-            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        frames.append(json_stat_to_long_df(payload, region_label, gender))
-    df = pd.concat(frames, ignore_index=True)
+    """One gender via the stats.swiss SDMX API (see SDMX_DATAFLOW_IDS above)."""
+    cache_path = INPUT_RAW_DIR / f"sdmx_{gender}.json"
+    if cache_path.exists() and not FORCE_REDOWNLOAD:
+        print(f"  (skip download, already have {cache_path.name})")
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    else:
+        print(f"Querying stats.swiss SDMX API: {gender} ...")
+        payload = fetch_sdmx_data(gender)
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    df = sdmx_json_to_long_df(payload, gender)
     print(f"  imported {len(df):,} rows for {gender} (native UTF-8, no encoding fallback needed)")
     return df
 
@@ -316,7 +327,7 @@ def check_name_encoding(df: pd.DataFrame, column: str) -> pd.Series:
 # =============================================================================
 
 def load_px_data():
-    print("\n=== Importing newborn-name data (PX Web API) ===\n")
+    print("\n=== Importing newborn-name data (stats.swiss SDMX API) ===\n")
     px_female = import_px_data("female")
     px_male = import_px_data("male")
     return px_female, px_male
@@ -905,20 +916,27 @@ def new_entries_table_html(df: pd.DataFrame, lang: str, comparison_year: int, da
     return _table(_th(headers), "".join(rows))
 
 
-# --- 4. regional top 3 (one table, all 3 regions, colour-coded rows) ----------
+# --- 4. regional top 3 (one table, all regions, colour-coded rows) -----------
 
 REGIONAL_TABLE_HEADERS = {
     "fr": ["Région", "Rang", "Garçon", "Fille"],
     "de": ["Region", "Rang", "Junge", "Mädchen"],
 }
 REGION_DISPLAY_NAMES = {
-    "fr": {"alemanique": "Suisse alémanique", "romande": "Suisse romande", "italienne": "Suisse italienne"},
-    "de": {"alemanique": "Deutschschweiz", "romande": "Romandie", "italienne": "Italienische Schweiz"},
+    "fr": {
+        "alemanique": "Suisse alémanique", "romande": "Suisse romande",
+        "italienne": "Suisse italienne", "romanche": "Suisse romanche",
+    },
+    "de": {
+        "alemanique": "Deutschschweiz", "romande": "Romandie",
+        "italienne": "Italienische Schweiz", "romanche": "Rätoromanische Schweiz",
+    },
 }
 REGION_ROW_COLORS = {
     "alemanique": "#dbeafe",  # light blue
     "romande": "#fef3c7",     # light amber
     "italienne": "#dcfce7",   # light green
+    "romanche": "#ede9fe",    # light purple
 }
 
 
